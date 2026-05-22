@@ -1,0 +1,2754 @@
+module Capnproto exposing
+    ( AnyPointer(..)
+    , Builder
+    , DataEncoder
+    , ListEncoder
+    , PointerEncoder
+    , PointerOffset
+    , PointerWriteInfo(..)
+    , Reader
+    , SegmentBuilder
+    , StructLayout
+    , Word64
+    , allocateBytes
+    , andMap
+    , anyPointerToData
+    , anyPointerToFloat64
+    , anyPointerToInt32
+    , anyPointerToText
+    , builderSegmentToBytes
+    , bytesToHexdump
+    , createBuilder
+    , createReader
+    , encodeAnyPointer
+    , encodeDataPointer
+    , encodeBoolList
+    , encodeFloat32List
+    , encodeFloat64List
+    , encodePrimitiveIntList
+    , encodeItemsList
+    , encodeListPointer
+    , encodeNullPointer
+    , encodeStructLayout
+    , encodeStructList
+    , encodeStructPointer
+    , encodeTextList
+    , encodeTextPointer
+    , finalize
+    , float64ToAnyPointer
+    , getListElementAt
+    , getListItem
+    , getListItems
+    , getListLength
+    , getListPointer
+    , getStructPointer
+    , int32ToAnyPointer
+    , nullPointerOffset
+    , readAnyPointer
+    , readBool
+    , readCapIndex
+    , readData
+    , readEnum
+    , readFloat32
+    , readFloat64
+    , readFloat32List
+    , readFloat64List
+    , readInt32List
+    , readList
+    , readPointer
+    , readText
+    , readTextList
+    , readUInt16
+    , readUInt32
+    , readUInt64
+    , readUInt8
+    , requireField
+    , textToAnyPointer
+    , toWord64
+    , traverseMaybe
+    , traverseResult
+    , wordSize
+    , writeBool
+    , writeBytesAtOffset
+    , writePointer
+    , writeStructPointer
+    , writeUInt16
+    , writeUInt32
+    , writeUInt64
+    , writeFloat32
+    , writeFloat64
+    , writeUInt8
+    , writeFloat32Xor
+    , writeFloat64Xor
+    , readFloat32Xor
+    , readFloat64Xor
+    , xorBytesPair
+    )
+
+import Array exposing (Array)
+import Bitwise
+import Bytes exposing (Bytes)
+import Bytes.Decode as BD
+import Bytes.Encode as BE
+import Dict exposing (Dict)
+
+
+
+-- Enhanced Types
+
+
+type alias Word64 =
+    { high : Int
+    , low : Int
+    }
+
+
+type AnyPointer
+    = AnyPointerEncoder (Builder -> ( Builder, PointerOffset, PointerWriteInfo ))
+    | AnyPointerDecoded PointerInfo
+
+
+type PointerWriteInfo
+    = PointerWriteInfoStructInfo Int Int -- dataWords, pointerWords
+    | PointerWriteInfoListInfo ListInfo -- 使用现有的 ListInfo 类型
+    | PointerWriteInfoTextInfo Int -- 文本指针，包含文本长度（包括 null terminator）
+    | PointerWriteInfoGenericPointer -- 通用指针
+
+
+type alias StructLayout =
+    { dataEncoders : List DataEncoder
+    , pointerEncoders : List PointerEncoder
+    , dataWords : Int
+    , pointerWords : Int
+    }
+
+
+type alias DataEncoder =
+    PointerOffset -> Builder -> Builder
+
+
+type alias PointerEncoder =
+    PointerOffset -> Int -> Builder -> Builder
+
+
+type alias ListEncoder a =
+    List a -> Builder -> ( Builder, PointerOffset, ListInfo )
+
+
+type alias ListInfo =
+    { elementCount : Int
+    , elementType : Int -- Cap'n Proto 元素类型
+    , elementSize : Int -- 元素大小（字节）
+    , isComposite : Bool
+    , dataWords : Int
+    , pointerWords : Int
+    }
+
+
+type PointerType
+    = StructPointer
+    | ListPointer
+    | OtherPointer
+    | NullPointer
+
+
+type alias PointerInfo =
+    { target : Reader
+    , pointerType : PointerType
+    , dataWords : Int -- 结构体数据字数
+    , pointerWords : Int -- 结构体指针字数
+    , elementType : Int -- 列表元素类型
+    , elementCount : Int -- 列表元素数量
+    , isComposite : Bool -- 是否复合列表
+    }
+
+
+
+-- Original Types
+
+
+type alias Builder =
+    { segments : Dict Int SegmentBuilder
+    , currentSegment : Int
+    , nextSegmentId : Int
+    }
+
+
+type alias SegmentBuilder =
+    { data : Array Int
+    , size : Int
+    , allocatedSize : Int
+    }
+
+
+type alias PointerOffset =
+    { segmentId : Int
+    , offset : Int
+    }
+
+
+
+-- Constants
+
+
+wordSize : Int
+wordSize =
+    8
+
+
+nullPointerOffset : PointerOffset
+nullPointerOffset =
+    { segmentId = -1, offset = -1 }
+
+
+emptyListInfo : ListInfo
+emptyListInfo =
+    { elementCount = 0
+    , elementType = 0
+    , elementSize = 0
+    , isComposite = False
+    , dataWords = 0
+    , pointerWords = 0
+    }
+
+
+emptyBytes : Bytes
+emptyBytes =
+    BE.encode (BE.sequence [])
+
+
+
+-- Builder creation
+
+
+createBuilder : Builder
+createBuilder =
+    { segments = Dict.singleton 0 emptySegment
+    , currentSegment = 0
+    , nextSegmentId = 1
+    }
+
+
+emptySegment : SegmentBuilder
+emptySegment =
+    { data = Array.empty
+    , size = 0
+    , allocatedSize = 0
+    }
+
+
+
+-- Word64 utilities
+
+
+toWord64 : Int -> Int -> Word64
+toWord64 high low =
+    { high = high, low = low }
+
+
+
+-- AnyPointer utilities
+
+
+{-| 将 AnyPointer 转换为文本（如果可能）
+-}
+anyPointerToText : AnyPointer -> Maybe String
+anyPointerToText pointer =
+    case pointer of
+        AnyPointerDecoded info ->
+            case info.pointerType of
+                ListPointer ->
+                    if info.elementType == 2 then
+                        -- Byte list
+                        let
+                            contentLength =
+                                info.elementCount - 1
+
+                            -- 不包括 null 终止符
+                        in
+                        BD.decode (BD.string contentLength) (extractBytesFromOffset info.target.bytes info.target.baseOffset contentLength)
+
+                    else
+                        Nothing
+
+                _ ->
+                    Nothing
+
+        _ ->
+            Nothing
+
+
+{-| 将 AnyPointer 转换为 32 位整数（如果可能）
+-}
+anyPointerToInt32 : AnyPointer -> Maybe Int
+anyPointerToInt32 pointer =
+    case pointer of
+        AnyPointerDecoded info ->
+            case info.pointerType of
+                StructPointer ->
+                    readUInt32 info.target 0
+
+                _ ->
+                    Nothing
+
+        _ ->
+            Nothing
+
+
+{-| 将 AnyPointer 转换为 64 位浮点数（如果可能）
+-}
+anyPointerToFloat64 : AnyPointer -> Maybe Float
+anyPointerToFloat64 pointer =
+    case pointer of
+        AnyPointerDecoded info ->
+            case info.pointerType of
+                StructPointer ->
+                    readFloat64 info.target 0
+
+                _ ->
+                    Nothing
+
+        _ ->
+            Nothing
+
+
+{-| 将 AnyPointer 转换为原始字节数据（如果可能）
+-}
+anyPointerToData : AnyPointer -> Maybe Bytes
+anyPointerToData pointer =
+    case pointer of
+        AnyPointerDecoded info ->
+            Just (extractBytesFromOffset info.target.bytes info.target.baseOffset (dataSizeOf info))
+
+        _ ->
+            Nothing
+
+
+{-| 将文本转换为 AnyPointer
+-}
+textToAnyPointer : String -> AnyPointer
+textToAnyPointer str =
+    let
+        bytes =
+            BE.encode (BE.string (str ++ "\u{0000}"))
+    in
+    AnyPointerEncoder
+        (\builder ->
+            let
+                ( newBuilder, offset ) =
+                    allocateText str builder
+            in
+            ( newBuilder
+            , offset
+            , PointerWriteInfoTextInfo (String.length str + 1)
+            )
+        )
+
+
+{-| 将 32 位整数转换为 AnyPointer
+-}
+int32ToAnyPointer : Int -> AnyPointer
+int32ToAnyPointer value =
+    AnyPointerEncoder
+        (\builder ->
+            let
+                ( newBuilder, offset ) =
+                    allocateBytes 4 builder
+            in
+            ( writeUInt32AtOffset offset 0 value newBuilder
+            , offset
+            , PointerWriteInfoGenericPointer
+            )
+        )
+
+
+{-| 将 64 位浮点数转换为 AnyPointer
+-}
+float64ToAnyPointer : Float -> AnyPointer
+float64ToAnyPointer value =
+    AnyPointerEncoder
+        (\builder ->
+            let
+                ( newBuilder, offset ) =
+                    allocateBytes 8 builder
+
+                encoder =
+                    BE.sequence [ BE.float64 Bytes.LE value ]
+
+                bytes =
+                    BE.encode encoder
+            in
+            ( writeBytesAtOffset offset 0 bytes newBuilder
+            , offset
+            , PointerWriteInfoGenericPointer
+            )
+        )
+
+
+
+-- High-level encoding functions
+
+
+encodeStructLayout : StructLayout -> Builder -> ( Builder, PointerOffset )
+encodeStructLayout layout builder =
+    let
+        -- 分配结构体空间
+        ( builder1, structOffset ) =
+            allocateStruct layout.dataWords layout.pointerWords builder
+
+        -- 应用数据编码器
+        builder2 =
+            List.foldl (\encoder b -> encoder structOffset b) builder1 layout.dataEncoders
+
+        -- 应用指针编码器 (忽略返回的 PointerOffset)
+        builder3 =
+            List.foldl
+                (\encoder ( b, pointerIndex ) ->
+                    let
+                        fieldOffset =
+                            layout.dataWords * wordSize + pointerIndex * wordSize
+                    in
+                    ( encoder structOffset fieldOffset b, pointerIndex + 1 )
+                )
+                ( builder2, 0 )
+                layout.pointerEncoders
+                -- 只取 Builder
+                |> Tuple.first
+    in
+    ( builder3, structOffset )
+
+
+{-| 文本指针编码器
+-}
+encodeTextPointer : String -> PointerEncoder
+encodeTextPointer text structOffset fieldOffset builder =
+    let
+        bytes =
+            BE.encode (BE.string (text ++ "\u{0000}"))
+    in
+    encodeDataPointer bytes structOffset fieldOffset builder
+
+
+{-| 数据指针编码器
+-}
+encodeDataPointer : Bytes -> PointerEncoder
+encodeDataPointer data structOffset fieldOffset builder =
+    let
+        dataLength =
+            Bytes.width data
+
+        -- 分配空间（包括填充）
+        ( builder1, dataOffset ) =
+            allocateBytes dataLength builder
+
+        -- 将数据写入分配的空间
+        builder2 =
+            writeBytesAtOffset dataOffset 0 data builder1
+
+        -- 列表信息：元素数量为 dataLength，元素类型为2（BYTE）
+        listInfo =
+            { elementCount = dataLength
+            , elementType = 2
+            , elementSize = 1
+            , isComposite = False
+            , dataWords = 0
+            , pointerWords = 0
+            }
+    in
+    writeListPointerWithInfo structOffset fieldOffset dataOffset listInfo builder2
+
+
+{-| 列表指针编码器
+-}
+encodeListPointer : ListEncoder a -> List a -> PointerEncoder
+encodeListPointer listEncoder items structOffset fieldOffset builder =
+    if List.isEmpty items then
+        encodeNullPointer structOffset fieldOffset builder
+
+    else
+        let
+            ( builder1, listOffset, listInfo ) =
+                listEncoder items builder
+        in
+        writeListPointerWithInfo structOffset fieldOffset listOffset listInfo builder1
+
+
+{-| 结构体列表编码器（返回列表信息）
+-}
+encodeStructList : (a -> StructLayout) -> Int -> Int -> ListEncoder a
+encodeStructList getLayout dataWords pointerWords items builder =
+    let
+        count =
+            List.length items
+
+        totalDataWords =
+            count * dataWords
+
+        totalPointerWords =
+            count * pointerWords
+
+        totalWords =
+            1 + totalDataWords + totalPointerWords
+
+        -- 标签字 + 数据部分 + 指针部分
+        totalBytes =
+            totalWords * wordSize
+
+        -- 分配整个列表空间
+        ( builder1, listOffset ) =
+            allocateBytes totalBytes builder
+
+        -- 写入复合列表标签头
+        tagLow =
+            Bitwise.shiftLeftBy 2 count
+
+        -- 元素数量左移2位 (A=0)
+        tagHigh =
+            Bitwise.or (Bitwise.shiftLeftBy 16 pointerWords) dataWords
+
+        builder2 =
+            builder1
+                |> writeUInt32AtOffset listOffset 0 tagLow
+                |> writeUInt32AtOffset listOffset 4 tagHigh
+
+        -- 计算数据区和指针区起始位置
+        dataStart =
+            { listOffset | offset = listOffset.offset + wordSize }
+
+        pointerStart =
+            { dataStart | offset = dataStart.offset + totalDataWords * wordSize }
+
+        -- 处理每个元素
+        processItem item ( b, idx ) =
+            let
+                layout =
+                    getLayout item
+
+                -- 每个元素的起始位置（包含数据和指针）
+                elementStart =
+                    { listOffset | offset = listOffset.offset + wordSize + idx * (dataWords + pointerWords) * wordSize }
+
+                -- 数据部分在元素内部
+                dataOffset =
+                    elementStart
+
+                -- 指针部分紧接在数据部分之后
+                ptrOffset =
+                    { elementStart | offset = elementStart.offset + dataWords * wordSize }
+
+                -- 应用数据部分编码器
+                b2 =
+                    List.foldl (\encoder builder_ -> encoder dataOffset builder_) b layout.dataEncoders
+
+                -- 应用指针部分编码器
+                b3 =
+                    List.foldl
+                        (\encoder ( builder_, ptrIdx ) ->
+                            ( encoder ptrOffset (ptrIdx * wordSize) builder_, ptrIdx + 1 )
+                        )
+                        ( b2, 0 )
+                        layout.pointerEncoders
+                        |> Tuple.first
+            in
+            ( b3, idx + 1 )
+    in
+    List.foldl processItem ( builder2, 0 ) items
+        |> Tuple.mapFirst
+            (\b ->
+                ( b
+                , listOffset
+                , { elementCount = count
+                  , elementType = 7 -- 复合类型
+                  , elementSize = 8 * (dataWords + pointerWords)
+                  , isComposite = True
+                  , dataWords = dataWords
+                  , pointerWords = pointerWords
+                  }
+                )
+            )
+        |> Tuple.first
+
+
+encodeStructPointer : a -> (a -> StructLayout) -> Int -> Int -> PointerEncoder
+encodeStructPointer value encoder dataWords pointerWords structOffset fieldOffset builder =
+    let
+        layout =
+            encoder value
+
+        ( newBuilder, targetOffset ) =
+            encodeStructLayout layout builder
+    in
+    writeStructPointer structOffset fieldOffset targetOffset dataWords pointerWords newBuilder
+
+
+
+-- 基础类型列表编码器
+
+
+{-| Int32列表编码器
+-}
+encodePrimitiveIntList : Int -> Int -> ListEncoder Int
+encodePrimitiveIntList elementTypeCode elementByteSize items builder =
+    if List.isEmpty items then
+        ( builder, nullPointerOffset, emptyListInfo )
+
+    else
+        let
+            count =
+                List.length items
+
+            totalBytes =
+                count * elementByteSize
+
+            ( builder1, listOffset ) =
+                allocateBytes totalBytes builder
+        in
+        ( List.foldl
+            (\( index, value ) b ->
+                case elementByteSize of
+                    1 ->
+                        writeUInt8AtOffset listOffset (index * 1) value b
+
+                    2 ->
+                        writeUInt16AtOffset listOffset (index * 2) value b
+
+                    4 ->
+                        writeUInt32AtOffset listOffset (index * 4) value b
+
+                    _ ->
+                        b
+            )
+            builder1
+            (List.indexedMap Tuple.pair items)
+        , listOffset
+        , { elementCount = count
+          , elementType = elementTypeCode
+          , elementSize = elementByteSize
+          , isComposite = False
+          , dataWords = 0
+          , pointerWords = 0
+          }
+        )
+
+
+encodeFloat64List : ListEncoder Float
+encodeFloat64List items builder =
+    if List.isEmpty items then
+        ( builder, nullPointerOffset, emptyListInfo )
+
+    else
+        let
+            count =
+                List.length items
+
+            totalBytes =
+                count * 8
+
+            ( builder1, listOffset ) =
+                allocateBytes totalBytes builder
+
+            encodedBytes =
+                BE.encode (BE.sequence (List.map (\v -> BE.float64 Bytes.LE v) items))
+        in
+        ( writeBytesAtOffset listOffset 0 encodedBytes builder1
+        , listOffset
+        , { elementCount = count
+          , elementType = 5
+          , elementSize = 8
+          , isComposite = False
+          , dataWords = 0
+          , pointerWords = 0
+          }
+        )
+
+
+encodeFloat32List : ListEncoder Float
+encodeFloat32List items builder =
+    if List.isEmpty items then
+        ( builder, nullPointerOffset, emptyListInfo )
+
+    else
+        let
+            count =
+                List.length items
+
+            totalBytes =
+                count * 4
+
+            ( builder1, listOffset ) =
+                allocateBytes totalBytes builder
+
+            encodedBytes =
+                BE.encode (BE.sequence (List.map (\v -> BE.float32 Bytes.LE v) items))
+        in
+        ( writeBytesAtOffset listOffset 0 encodedBytes builder1
+        , listOffset
+        , { elementCount = count
+          , elementType = 4
+          , elementSize = 4
+          , isComposite = False
+          , dataWords = 0
+          , pointerWords = 0
+          }
+        )
+
+
+encodeBoolList : ListEncoder Bool
+encodeBoolList items builder =
+    if List.isEmpty items then
+        ( builder, nullPointerOffset, emptyListInfo )
+
+    else
+        let
+            count =
+                List.length items
+
+            totalBytes =
+                (count + 7) // 8
+
+            ( builder1, listOffset ) =
+                allocateBytes totalBytes builder
+
+            builder2 =
+                List.foldl
+                    (\( index, value ) b ->
+                        if value then
+                            let
+                                byteIndex =
+                                    index // 8
+
+                                bitIndex =
+                                    Bitwise.and index 7
+
+                                currentByte =
+                                    case Dict.get listOffset.segmentId b.segments of
+                                        Just seg ->
+                                            Array.get (listOffset.offset + byteIndex) seg.data
+                                                |> Maybe.withDefault 0
+
+                                        Nothing ->
+                                            0
+
+                                mask =
+                                    Bitwise.shiftLeftBy bitIndex 1
+
+                                newByte =
+                                    Bitwise.or currentByte mask
+                            in
+                            writeUInt8AtOffset listOffset byteIndex newByte b
+
+                        else
+                            b
+                    )
+                    builder1
+                    (List.indexedMap Tuple.pair items)
+        in
+        ( builder2
+        , listOffset
+        , { elementCount = count
+          , elementType = 1
+          , elementSize = 0
+          , isComposite = False
+          , dataWords = 0
+          , pointerWords = 0
+          }
+        )
+
+
+
+encodeInt32List : ListEncoder Int
+encodeInt32List items builder =
+    if List.isEmpty items then
+        -- 空列表时返回空指针信息
+        ( builder, nullPointerOffset, emptyListInfo )
+
+    else
+        let
+            itemEncoder value builder0 =
+                let
+                    ( builder1, listOffset ) =
+                        allocateList 1 4 builder0
+
+                    -- Single-element list
+                    builder2 =
+                        writeUInt32AtOffset listOffset 8 value builder1
+
+                    writePtr targetOffset b =
+                        let
+                            listInfo =
+                                { elementCount = 1
+                                , elementType = 1 -- Int32 type
+                                , elementSize = 4
+                                , isComposite = False
+                                , dataWords = 0
+                                , pointerWords = 0
+                                }
+                        in
+                        writeListPointerWithInfo targetOffset 0 listOffset listInfo b
+                in
+                ( builder2, writePtr )
+        in
+        encodeItemsList items itemEncoder builder
+
+
+{-| 文本列表编码器
+-}
+encodeTextList : ListEncoder String
+encodeTextList items builder =
+    if List.isEmpty items then
+        -- 空列表时返回空指针信息
+        ( builder, nullPointerOffset, emptyListInfo )
+
+    else
+        let
+            itemEncoder text builder0 =
+                let
+                    ( builder1, textOffset ) =
+                        allocateText text builder0
+
+                    writePtr targetOffset b =
+                        let
+                            textListInfo =
+                                { elementCount = String.length text + 1
+                                , elementType = 2 -- Byte list
+                                , elementSize = 1
+                                , isComposite = False
+                                , dataWords = 0
+                                , pointerWords = 0
+                                }
+                        in
+                        writeListPointerWithInfo targetOffset 0 textOffset textListInfo b
+                in
+                ( builder1, writePtr )
+        in
+        encodeItemsList items itemEncoder builder
+
+
+encodeItemsList :
+    List a
+    -> (a -> Builder -> ( Builder, PointerOffset -> Builder -> Builder ))
+    -> Builder
+    -> ( Builder, PointerOffset, ListInfo )
+encodeItemsList items itemEncoder builder =
+    if List.isEmpty items then
+        -- 空列表时返回空指针信息
+        ( builder, nullPointerOffset, emptyListInfo )
+
+    else
+        let
+            count =
+                List.length items
+
+            ( builder1, listOffset ) =
+                allocateList count 8 builder
+
+            contentStartOffset =
+                listOffset.offset + 8
+
+            ( builder2, _ ) =
+                List.foldl
+                    (\item ( b, index ) ->
+                        let
+                            elementOffset =
+                                contentStartOffset + index * 8
+
+                            ( newBuilder, writePtr ) =
+                                itemEncoder item b
+                        in
+                        ( writePtr
+                            { segmentId = listOffset.segmentId, offset = elementOffset }
+                            newBuilder
+                        , index + 1
+                        )
+                    )
+                    ( builder1, 0 )
+                    items
+
+            listInfo =
+                { elementCount = count
+                , elementType = 0 -- Pointer type
+                , elementSize = 8
+                , isComposite = False
+                , dataWords = 0
+                , pointerWords = 0
+                }
+        in
+        ( builder2, listOffset, listInfo )
+
+
+encodeAnyPointer : AnyPointer -> PointerEncoder
+encodeAnyPointer anyPointer structOffset fieldOffset builder =
+    case anyPointer of
+        AnyPointerEncoder encoderFunc ->
+            let
+                ( builderWithObject, targetOffset, writeInfo ) =
+                    encoderFunc builder
+            in
+            case writeInfo of
+                PointerWriteInfoStructInfo dataWords pointerWords ->
+                    writeStructPointer structOffset fieldOffset targetOffset dataWords pointerWords builderWithObject
+
+                PointerWriteInfoListInfo listInfo ->
+                    writeListPointerWithInfo structOffset fieldOffset targetOffset listInfo builderWithObject
+
+                PointerWriteInfoTextInfo textLength ->
+                    -- 文本作为字节列表处理
+                    let
+                        textListInfo =
+                            { elementCount = textLength
+                            , elementType = 2 -- BYTE 类型
+                            , elementSize = 1
+                            , isComposite = False
+                            , dataWords = 0
+                            , pointerWords = 0
+                            }
+                    in
+                    writeListPointerWithInfo structOffset fieldOffset targetOffset textListInfo builderWithObject
+
+                PointerWriteInfoGenericPointer ->
+                    writePointer structOffset fieldOffset targetOffset builderWithObject
+
+        AnyPointerDecoded info ->
+            encodeDecodedPointer info.target builder structOffset fieldOffset
+
+
+{-| 编码已解码的指针数据 - 需要分析指针类型并递归处理
+-}
+encodeDecodedPointer : Reader -> Builder -> PointerOffset -> Int -> Builder
+encodeDecodedPointer reader builder structOffset fieldOffset =
+    case readPointer reader 0 of
+        Just pointerInfo ->
+            case pointerInfo.pointerType of
+                StructPointer ->
+                    encodeStructPointerContent pointerInfo reader.bytes builder structOffset fieldOffset
+
+                ListPointer ->
+                    encodeListPointerContent pointerInfo reader.bytes builder structOffset fieldOffset
+
+                NullPointer ->
+                    encodeNullPointer structOffset fieldOffset builder
+
+                OtherPointer ->
+                    encodeGenericPointerContent pointerInfo reader builder structOffset fieldOffset
+
+        Nothing ->
+            encodeNullPointer structOffset fieldOffset builder
+
+
+{-| 处理未知类型的指针内容 - 直接复制原始数据
+-}
+encodeGenericPointerContent : PointerInfo -> Reader -> Builder -> PointerOffset -> Int -> Builder
+encodeGenericPointerContent pointerInfo reader builder structOffset fieldOffset =
+    let
+        contentSize =
+            dataSizeOf pointerInfo
+
+        contentBytes =
+            extractBytesFromOffset reader.bytes pointerInfo.target.baseOffset contentSize
+
+        ( newBuilder, targetOffset ) =
+            allocateBytes contentSize builder
+
+        builderWithContent =
+            writeBytesAtOffset targetOffset 0 contentBytes newBuilder
+    in
+    writePointer structOffset fieldOffset targetOffset builderWithContent
+
+
+{-| 处理结构体指针内容（包括递归处理指针字段）
+-}
+encodeStructPointerContent : PointerInfo -> Bytes -> Builder -> PointerOffset -> Int -> Builder
+encodeStructPointerContent info sourceBytes builder structOffset fieldOffset =
+    let
+        -- 分配新的结构体空间
+        ( builder1, targetOffset ) =
+            allocateStruct info.dataWords info.pointerWords builder
+
+        -- 复制数据部分（非指针字段的直接复制）
+        dataSize =
+            info.dataWords * wordSize
+
+        dataBytes =
+            extractBytesFromOffset sourceBytes info.target.baseOffset dataSize
+
+        builder2 =
+            writeBytesAtOffset targetOffset 0 dataBytes builder1
+
+        -- 递归处理指针部分
+        sourceReader =
+            { bytes = sourceBytes, baseOffset = info.target.baseOffset }
+
+        builder3 =
+            processStructPointers sourceReader builder2 targetOffset info.dataWords info.pointerWords 0
+    in
+    writeStructPointer structOffset fieldOffset targetOffset info.dataWords info.pointerWords builder3
+
+
+{-| 处理列表指针内容（需要处理列表中的复合元素）
+-}
+encodeListPointerContent : PointerInfo -> Bytes -> Builder -> PointerOffset -> Int -> Builder
+encodeListPointerContent info sourceBytes builder structOffset fieldOffset =
+    if info.isComposite then
+        -- 复合列表需要递归处理每个元素
+        encodeCompositeListContent info sourceBytes builder structOffset fieldOffset
+
+    else if info.elementType == 6 then
+        -- 指针列表需要递归处理每个指针
+        encodePointerListContent info sourceBytes builder structOffset fieldOffset
+
+    else
+        -- 原始类型列表直接复制
+        encodeSimpleListContent info sourceBytes builder structOffset fieldOffset
+
+
+{-| 递归处理结构体中的指针字段
+-}
+processStructPointers : Reader -> Builder -> PointerOffset -> Int -> Int -> Int -> Builder
+processStructPointers sourceReader builder targetOffset dataWords pointerWords currentIndex =
+    if currentIndex >= pointerWords then
+        builder
+
+    else
+        let
+            -- 源指针的偏移（相对于结构体开始）
+            sourcePointerOffset =
+                dataWords * wordSize + currentIndex * wordSize
+
+            -- 目标指针的偏移（相对于新结构体开始）
+            targetPointerOffset =
+                dataWords * wordSize + currentIndex * wordSize
+        in
+        case readPointer sourceReader sourcePointerOffset of
+            Just pointerInfo ->
+                let
+                    -- 根据指针类型递归处理
+                    builderAfterPointer =
+                        case pointerInfo.pointerType of
+                            StructPointer ->
+                                encodeStructPointerContent pointerInfo sourceReader.bytes builder targetOffset targetPointerOffset
+
+                            ListPointer ->
+                                encodeListPointerContent pointerInfo sourceReader.bytes builder targetOffset targetPointerOffset
+
+                            NullPointer ->
+                                encodeNullPointer targetOffset targetPointerOffset builder
+
+                            OtherPointer ->
+                                -- 对于其他类型，进行完整的数据复制
+                                let
+                                    contentSize =
+                                        dataSizeOf pointerInfo
+
+                                    contentBytes =
+                                        extractBytesFromOffset sourceReader.bytes pointerInfo.target.baseOffset contentSize
+
+                                    ( newBuilder, newTargetOffset ) =
+                                        allocateBytes contentSize builder
+
+                                    builderWithContent =
+                                        writeBytesAtOffset newTargetOffset 0 contentBytes newBuilder
+                                in
+                                writePointer targetOffset targetPointerOffset newTargetOffset builderWithContent
+                in
+                processStructPointers sourceReader builderAfterPointer targetOffset dataWords pointerWords (currentIndex + 1)
+
+            Nothing ->
+                -- 读取失败，写入空指针
+                let
+                    builderWithNull =
+                        encodeNullPointer targetOffset targetPointerOffset builder
+                in
+                processStructPointers sourceReader builderWithNull targetOffset dataWords pointerWords (currentIndex + 1)
+
+
+{-| 处理复合列表内容
+-}
+encodeCompositeListContent : PointerInfo -> Bytes -> Builder -> PointerOffset -> Int -> Builder
+encodeCompositeListContent info sourceBytes builder structOffset fieldOffset =
+    let
+        -- 分配新的列表空间（包含标签字）
+        totalDataWords =
+            info.elementCount * info.dataWords
+
+        totalPointerWords =
+            info.elementCount * info.pointerWords
+
+        totalWords =
+            1 + totalDataWords + totalPointerWords
+
+        totalSize =
+            totalWords * wordSize
+
+        ( builder1, targetOffset ) =
+            allocateBytes totalSize builder
+
+        -- 复制标签字
+        tagBytes =
+            extractBytesFromOffset sourceBytes info.target.baseOffset wordSize
+
+        builder2 =
+            writeBytesAtOffset targetOffset 0 tagBytes builder1
+
+        -- 递归处理每个复合元素
+        sourceReader =
+            { bytes = sourceBytes, baseOffset = info.target.baseOffset + wordSize }
+
+        builder3 =
+            processCompositeListElements sourceReader builder2 targetOffset info 0
+
+        listInfo =
+            { elementCount = info.elementCount
+            , elementType = info.elementType
+            , elementSize = (info.dataWords + info.pointerWords) * wordSize
+            , isComposite = True
+            , dataWords = info.dataWords
+            , pointerWords = info.pointerWords
+            }
+    in
+    writeListPointerWithInfo structOffset fieldOffset targetOffset listInfo builder3
+
+
+{-| 处理指针列表内容
+-}
+encodePointerListContent : PointerInfo -> Bytes -> Builder -> PointerOffset -> Int -> Builder
+encodePointerListContent info sourceBytes builder structOffset fieldOffset =
+    let
+        listSize =
+            info.elementCount * wordSize
+
+        ( builder1, targetOffset ) =
+            allocateBytes listSize builder
+
+        sourceReader =
+            { bytes = sourceBytes, baseOffset = info.target.baseOffset }
+
+        builder2 =
+            processPointerListElements sourceReader builder1 targetOffset info 0
+
+        listInfo =
+            { elementCount = info.elementCount
+            , elementType = 6 -- 指针类型
+            , elementSize = wordSize
+            , isComposite = False
+            , dataWords = 0
+            , pointerWords = 0
+            }
+    in
+    writeListPointerWithInfo structOffset fieldOffset targetOffset listInfo builder2
+
+
+{-| 处理简单类型列表内容
+-}
+encodeSimpleListContent : PointerInfo -> Bytes -> Builder -> PointerOffset -> Int -> Builder
+encodeSimpleListContent info sourceBytes builder structOffset fieldOffset =
+    let
+        contentSize =
+            dataSizeOf info
+
+        contentBytes =
+            extractBytesFromOffset sourceBytes info.target.baseOffset contentSize
+
+        ( builder1, targetOffset ) =
+            allocateBytes contentSize builder
+
+        builder2 =
+            writeBytesAtOffset targetOffset 0 contentBytes builder1
+
+        listInfo =
+            { elementCount = info.elementCount
+            , elementType = info.elementType
+            , elementSize = elementSizeOf info
+            , isComposite = False
+            , dataWords = 0
+            , pointerWords = 0
+            }
+    in
+    writeListPointerWithInfo structOffset fieldOffset targetOffset listInfo builder2
+
+
+{-| 递归处理复合列表中的每个元素
+-}
+processCompositeListElements : Reader -> Builder -> PointerOffset -> PointerInfo -> Int -> Builder
+processCompositeListElements sourceReader builder targetListOffset info currentIndex =
+    if currentIndex >= info.elementCount then
+        builder
+
+    else
+        let
+            -- 计算当前元素的偏移
+            elementSize =
+                (info.dataWords + info.pointerWords) * wordSize
+
+            sourceElementOffset =
+                sourceReader.baseOffset + currentIndex * elementSize
+
+            targetElementOffset =
+                targetListOffset.offset + wordSize + currentIndex * elementSize
+
+            -- 复制数据部分
+            dataSize =
+                info.dataWords * wordSize
+
+            dataBytes =
+                extractBytesFromOffset sourceReader.bytes sourceElementOffset dataSize
+
+            builder1 =
+                writeBytesAtOffset { targetListOffset | offset = targetElementOffset } 0 dataBytes builder
+
+            -- 处理指针部分
+            elementReader =
+                { sourceReader | baseOffset = sourceElementOffset }
+
+            targetElementPointer =
+                { targetListOffset | offset = targetElementOffset }
+
+            builder2 =
+                processStructPointers elementReader builder1 targetElementPointer info.dataWords info.pointerWords 0
+        in
+        processCompositeListElements sourceReader builder2 targetListOffset info (currentIndex + 1)
+
+
+{-| 递归处理指针列表中的每个指针
+-}
+processPointerListElements : Reader -> Builder -> PointerOffset -> PointerInfo -> Int -> Builder
+processPointerListElements sourceReader builder targetListOffset info currentIndex =
+    if currentIndex >= info.elementCount then
+        builder
+
+    else
+        let
+            sourcePointerOffset =
+                currentIndex * wordSize
+
+            targetPointerOffset =
+                targetListOffset.offset + currentIndex * wordSize
+        in
+        case readPointer sourceReader sourcePointerOffset of
+            Just pointerInfo ->
+                let
+                    builderAfterPointer =
+                        case pointerInfo.pointerType of
+                            StructPointer ->
+                                encodeStructPointerContent pointerInfo sourceReader.bytes builder { targetListOffset | offset = targetPointerOffset } 0
+
+                            ListPointer ->
+                                encodeListPointerContent pointerInfo sourceReader.bytes builder { targetListOffset | offset = targetPointerOffset } 0
+
+                            NullPointer ->
+                                encodeNullPointer { targetListOffset | offset = targetPointerOffset } 0 builder
+
+                            OtherPointer ->
+                                let
+                                    contentSize =
+                                        dataSizeOf pointerInfo
+
+                                    contentBytes =
+                                        extractBytesFromOffset sourceReader.bytes pointerInfo.target.baseOffset contentSize
+
+                                    ( newBuilder, newTargetOffset ) =
+                                        allocateBytes contentSize builder
+
+                                    builderWithContent =
+                                        writeBytesAtOffset newTargetOffset 0 contentBytes newBuilder
+                                in
+                                writePointer { targetListOffset | offset = targetPointerOffset } 0 newTargetOffset builderWithContent
+                in
+                processPointerListElements sourceReader builderAfterPointer targetListOffset info (currentIndex + 1)
+
+            Nothing ->
+                let
+                    builderWithNull =
+                        encodeNullPointer { targetListOffset | offset = targetPointerOffset } 0 builder
+                in
+                processPointerListElements sourceReader builderWithNull targetListOffset info (currentIndex + 1)
+
+
+
+-- 辅助函数：从指定偏移量提取字节
+
+
+extractBytesFromOffset : Bytes -> Int -> Int -> Bytes
+extractBytesFromOffset sourceBytes offset length =
+    let
+        decoder =
+            BD.bytes offset
+                |> BD.andThen (\_ -> BD.bytes length)
+    in
+    case BD.decode decoder sourceBytes of
+        Just extractedBytes ->
+            extractedBytes
+
+        Nothing ->
+            emptyBytes
+
+
+encodeNullPointer : PointerEncoder
+encodeNullPointer structOffset fieldOffset builder =
+    builder
+        |> writeUInt32AtOffset structOffset fieldOffset 0
+        |> writeUInt32AtOffset structOffset (fieldOffset + 4) 0
+
+
+
+-- Memory allocation
+
+
+allocateBytes : Int -> Builder -> ( Builder, PointerOffset )
+allocateBytes size builder =
+    let
+        alignedSize =
+            (size + 7)
+                |> Bitwise.shiftRightBy 3
+                |> Bitwise.shiftLeftBy 3
+
+        segment =
+            Dict.get builder.currentSegment builder.segments
+                |> Maybe.withDefault emptySegment
+
+        offset =
+            segment.size
+
+        newData =
+            Array.append segment.data (Array.repeat alignedSize 0)
+
+        newSegment =
+            { segment
+                | data = newData
+                , size = segment.size + alignedSize
+                , allocatedSize = segment.allocatedSize + size
+            }
+
+        newBuilder =
+            { builder
+                | segments = Dict.insert builder.currentSegment newSegment builder.segments
+            }
+    in
+    ( newBuilder, { segmentId = builder.currentSegment, offset = offset } )
+
+
+allocateStruct : Int -> Int -> Builder -> ( Builder, PointerOffset )
+allocateStruct dataWords pointerWords builder =
+    let
+        totalWords =
+            dataWords + pointerWords
+
+        totalSize =
+            totalWords * wordSize
+
+        segment =
+            Dict.get builder.currentSegment builder.segments
+                |> Maybe.withDefault emptySegment
+
+        offset =
+            segment.size
+
+        newData =
+            Array.append segment.data (Array.repeat totalSize 0)
+
+        newSegment =
+            { segment
+                | data = newData
+                , size = segment.size + totalSize
+                , allocatedSize = segment.allocatedSize + totalSize
+            }
+
+        newBuilder =
+            { builder
+                | segments = Dict.insert builder.currentSegment newSegment builder.segments
+            }
+    in
+    ( newBuilder, { segmentId = builder.currentSegment, offset = offset } )
+
+
+allocateList : Int -> Int -> Builder -> ( Builder, PointerOffset )
+allocateList elementCount elementSize builder =
+    let
+        headerSize =
+            8
+
+        contentSize =
+            elementCount * elementSize
+
+        totalSize =
+            headerSize + contentSize
+
+        segment =
+            Dict.get builder.currentSegment builder.segments
+                |> Maybe.withDefault emptySegment
+
+        offset =
+            segment.size
+
+        newData =
+            Array.append segment.data (Array.repeat totalSize 0)
+
+        newSegment =
+            { segment
+                | data = newData
+                , size = segment.size + totalSize
+                , allocatedSize = segment.allocatedSize + totalSize
+            }
+
+        newBuilder =
+            { builder
+                | segments = Dict.insert builder.currentSegment newSegment builder.segments
+            }
+
+        -- 写入列表头
+        builderWithHeader =
+            newBuilder
+                |> writeUInt32AtOffset { segmentId = builder.currentSegment, offset = offset } 0 elementCount
+                |> writeUInt32AtOffset { segmentId = builder.currentSegment, offset = offset } 4 0
+    in
+    ( builderWithHeader, { segmentId = builder.currentSegment, offset = offset } )
+
+
+allocateText : String -> Builder -> ( Builder, PointerOffset )
+allocateText text builder =
+    let
+        -- Cap'n Proto 文本格式：列表头 + 字符串字节 + null terminator
+        bytes =
+            BE.encode (BE.string (text ++ "\u{0000}"))
+
+        textLength =
+            Bytes.width bytes
+    in
+    allocateBytes textLength builder
+
+
+
+-- Writing functions
+
+
+writeUInt8 : PointerOffset -> Int -> Int -> Builder -> Builder
+writeUInt8 structOffset fieldOffset value builder =
+    writeUInt8AtOffset structOffset fieldOffset value builder
+
+
+writeUInt16 : PointerOffset -> Int -> Int -> Builder -> Builder
+writeUInt16 structOffset fieldOffset value builder =
+    writeUInt16AtOffset structOffset fieldOffset value builder
+
+
+writeUInt32 : PointerOffset -> Int -> Int -> Builder -> Builder
+writeUInt32 structOffset fieldOffset value builder =
+    writeUInt32AtOffset structOffset fieldOffset value builder
+
+
+writeUInt64 : PointerOffset -> Int -> Word64 -> Builder -> Builder
+writeUInt64 structOffset fieldOffset word64 builder =
+    builder
+        |> writeUInt32AtOffset structOffset fieldOffset word64.low
+        |> writeUInt32AtOffset structOffset (fieldOffset + 4) word64.high
+
+
+writeBool : PointerOffset -> Int -> Int -> Bool -> Builder -> Builder
+writeBool structOffset fieldOffset bitOffset value builder =
+    let
+        byteOffset =
+            fieldOffset + Bitwise.shiftRightBy 3 bitOffset
+
+        bitIndex =
+            Bitwise.and bitOffset 7
+    in
+    writeBoolAtOffset structOffset byteOffset bitIndex value builder
+
+
+writeFloat32 : PointerOffset -> Int -> Float -> Builder -> Builder
+writeFloat32 structOffset fieldOffset value builder =
+    let
+        encoder =
+            BE.sequence [ BE.float32 Bytes.LE value ]
+
+        bytes =
+            BE.encode encoder
+    in
+    writeBytesAtOffset structOffset fieldOffset bytes builder
+
+
+writeFloat64 : PointerOffset -> Int -> Float -> Builder -> Builder
+writeFloat64 structOffset fieldOffset value builder =
+    let
+        encoder =
+            BE.sequence [ BE.float64 Bytes.LE value ]
+
+        bytes =
+            BE.encode encoder
+    in
+    writeBytesAtOffset structOffset fieldOffset bytes builder
+
+
+{-| XOR two Bytes of equal length, byte by byte
+-}
+xorBytesPair : Bytes -> Bytes -> Bytes
+xorBytesPair a b =
+    let
+        width =
+            Bytes.width a
+
+        listA =
+            BD.decode (BD.loop ( 0, [] ) (decodeByteListHelper width)) a
+
+        listB =
+            BD.decode (BD.loop ( 0, [] ) (decodeByteListHelper width)) b
+    in
+    case ( listA, listB ) of
+        ( Just la, Just lb ) ->
+            BE.encode (BE.sequence (List.map2 (\x y -> BE.unsignedInt8 (Bitwise.xor x y)) la lb))
+
+        _ ->
+            a
+
+
+decodeByteListHelper : Int -> ( Int, List Int ) -> BD.Decoder (BD.Step ( Int, List Int ) (List Int))
+decodeByteListHelper width ( offset, acc ) =
+    if offset >= width then
+        BD.succeed (BD.Done (List.reverse acc))
+
+    else
+        BD.unsignedInt8 |> BD.map (\byte -> BD.Loop ( offset + 1, byte :: acc ))
+
+
+{-| Write Float32 with XOR default mask applied at byte level.
+    Stores: IEEE754(value) XOR IEEE754(default_)
+-}
+writeFloat32Xor : PointerOffset -> Int -> Float -> Float -> Builder -> Builder
+writeFloat32Xor structOffset fieldOffset value default_ builder =
+    let
+        valueBytes =
+            BE.encode (BE.sequence [ BE.float32 Bytes.LE value ])
+
+        defaultBytes =
+            BE.encode (BE.sequence [ BE.float32 Bytes.LE default_ ])
+
+        xoredBytes =
+            xorBytesPair valueBytes defaultBytes
+    in
+    writeBytesAtOffset structOffset fieldOffset xoredBytes builder
+
+
+{-| Write Float64 with XOR default mask applied at byte level.
+    Stores: IEEE754(value) XOR IEEE754(default_)
+-}
+writeFloat64Xor : PointerOffset -> Int -> Float -> Float -> Builder -> Builder
+writeFloat64Xor structOffset fieldOffset value default_ builder =
+    let
+        valueBytes =
+            BE.encode (BE.sequence [ BE.float64 Bytes.LE value ])
+
+        defaultBytes =
+            BE.encode (BE.sequence [ BE.float64 Bytes.LE default_ ])
+
+        xoredBytes =
+            xorBytesPair valueBytes defaultBytes
+    in
+    writeBytesAtOffset structOffset fieldOffset xoredBytes builder
+
+
+{-| Read Float32 with XOR default mask applied at byte level.
+    Returns: bitsToFloat32( readBits XOR bits(default_) )
+-}
+readFloat32Xor : Reader -> Int -> Float -> Maybe Float
+readFloat32Xor reader offset default_ =
+    readUInt32 reader offset
+        |> Maybe.map
+            (\storedBits ->
+                let
+                    defaultBits =
+                        float32ToBits default_
+
+                    actualBits =
+                        Bitwise.xor storedBits defaultBits
+                in
+                bitsToFloat32 actualBits
+            )
+
+
+{-| Read Float64 with XOR default mask applied at byte level.
+    Returns: bitsToFloat64( readBits XOR bits(default_) )
+-}
+readFloat64Xor : Reader -> Int -> Float -> Maybe Float
+readFloat64Xor reader offset default_ =
+    readUInt64 reader offset
+        |> Maybe.map
+            (\stored ->
+                let
+                    defaultWord =
+                        float64ToWord64 default_
+
+                    actualLow =
+                        Bitwise.xor stored.low defaultWord.low
+
+                    actualHigh =
+                        Bitwise.xor stored.high defaultWord.high
+                in
+                word64ToFloat64 { high = actualHigh, low = actualLow }
+            )
+
+
+{-| Convert Float32 to its IEEE 754 bit pattern (UInt32)
+-}
+float32ToBits : Float -> Int
+float32ToBits f =
+    let
+        bytes =
+            BE.encode (BE.float32 Bytes.LE f)
+    in
+    case BD.decode (BD.unsignedInt32 Bytes.LE) bytes of
+        Just bits ->
+            bits
+
+        Nothing ->
+            0
+
+
+{-| Convert UInt32 bit pattern back to Float32
+-}
+bitsToFloat32 : Int -> Float
+bitsToFloat32 bits =
+    let
+        bytes =
+            BE.encode (BE.unsignedInt32 Bytes.LE bits)
+    in
+    case BD.decode (BD.float32 Bytes.LE) bytes of
+        Just f ->
+            f
+
+        Nothing ->
+            0.0
+
+
+{-| Convert Float64 to its IEEE 754 bit pattern (Word64)
+-}
+float64ToWord64 : Float -> Word64
+float64ToWord64 f =
+    let
+        bytes =
+            BE.encode (BE.sequence [ BE.float64 Bytes.LE f ])
+
+        decoder =
+            BD.map2 (\low high -> Word64 high low)
+                (BD.unsignedInt32 Bytes.LE)
+                (BD.unsignedInt32 Bytes.LE)
+    in
+    case BD.decode (BD.bytes 0 |> BD.andThen (\_ -> decoder)) bytes of
+        Just w ->
+            w
+
+        Nothing ->
+            { high = 0, low = 0 }
+
+
+{-| Convert Word64 bit pattern back to Float64
+-}
+word64ToFloat64 : Word64 -> Float
+word64ToFloat64 w =
+    let
+        bytes =
+            BE.encode (BE.sequence [ BE.unsignedInt32 Bytes.LE w.low, BE.unsignedInt32 Bytes.LE w.high ])
+    in
+    case BD.decode (BD.bytes 0 |> BD.andThen (\_ -> BD.float64 Bytes.LE)) bytes of
+        Just f ->
+            f
+
+        Nothing ->
+            0.0
+
+
+writeStructPointer : PointerOffset -> Int -> PointerOffset -> Int -> Int -> Builder -> Builder
+writeStructPointer structOffset fieldOffset targetOffset dataWords pointerWords builder =
+    if targetOffset == nullPointerOffset then
+        builder
+            |> writeUInt32AtOffset structOffset fieldOffset 0
+            |> writeUInt32AtOffset structOffset (fieldOffset + 4) 0
+
+    else
+        let
+            offsetWords =
+                (targetOffset.offset - (structOffset.offset + fieldOffset) - 8) // 8
+
+            -- 低位 = (偏移量 << 2) | 0（结构体类型）
+            pointerValue =
+                Bitwise.shiftLeftBy 2 offsetWords
+
+            -- 高位 = (pointerWord << 16) | dataWord
+            structInfo =
+                Bitwise.or (Bitwise.shiftLeftBy 16 pointerWords) dataWords
+        in
+        builder
+            |> writeUInt32AtOffset structOffset fieldOffset pointerValue
+            |> writeUInt32AtOffset structOffset (fieldOffset + 4) structInfo
+
+
+writePointer : PointerOffset -> Int -> PointerOffset -> Builder -> Builder
+writePointer structOffset fieldOffset targetOffset builder =
+    let
+        offsetWords =
+            (targetOffset.offset - structOffset.offset - fieldOffset - 8) // 8
+
+        pointerValue =
+            -- 类型=1表示列表
+            Bitwise.or (Bitwise.shiftLeftBy 2 offsetWords) 1
+
+        listInfo =
+            -- 列表类型信息
+            0
+    in
+    builder
+        |> writeUInt32AtOffset structOffset fieldOffset pointerValue
+        |> writeUInt32AtOffset structOffset (fieldOffset + 4) listInfo
+
+
+
+-- Helper functions
+
+
+writeUInt8AtOffset : PointerOffset -> Int -> Int -> Builder -> Builder
+writeUInt8AtOffset structOffset fieldOffset value builder =
+    let
+        absoluteOffset =
+            structOffset.offset + fieldOffset
+
+        segment =
+            Dict.get structOffset.segmentId builder.segments
+                |> Maybe.withDefault emptySegment
+
+        newData =
+            Array.set absoluteOffset value segment.data
+
+        newSegment =
+            { segment | data = newData }
+
+        newBuilder =
+            { builder | segments = Dict.insert structOffset.segmentId newSegment builder.segments }
+    in
+    newBuilder
+
+
+writeUInt16AtOffset : PointerOffset -> Int -> Int -> Builder -> Builder
+writeUInt16AtOffset structOffset fieldOffset value builder =
+    let
+        byte0 =
+            Bitwise.and value 0xFF
+
+        byte1 =
+            Bitwise.and (Bitwise.shiftRightBy 8 value) 0xFF
+    in
+    builder
+        |> writeUInt8AtOffset structOffset fieldOffset byte0
+        |> writeUInt8AtOffset structOffset (fieldOffset + 1) byte1
+
+
+writeUInt32AtOffset : PointerOffset -> Int -> Int -> Builder -> Builder
+writeUInt32AtOffset structOffset fieldOffset value builder =
+    let
+        byte0 =
+            Bitwise.and value 0xFF
+
+        byte1 =
+            Bitwise.and (Bitwise.shiftRightBy 8 value) 0xFF
+
+        byte2 =
+            Bitwise.and (Bitwise.shiftRightBy 16 value) 0xFF
+
+        byte3 =
+            Bitwise.and (Bitwise.shiftRightBy 24 value) 0xFF
+    in
+    builder
+        |> writeUInt8AtOffset structOffset fieldOffset byte0
+        |> writeUInt8AtOffset structOffset (fieldOffset + 1) byte1
+        |> writeUInt8AtOffset structOffset (fieldOffset + 2) byte2
+        |> writeUInt8AtOffset structOffset (fieldOffset + 3) byte3
+
+
+writeStringAtOffset : PointerOffset -> Int -> String -> Builder -> Builder
+writeStringAtOffset structOffset fieldOffset text builder =
+    let
+        textBytes =
+            String.toList text |> List.map Char.toCode
+
+        writeByteAt index byte b =
+            writeUInt8AtOffset structOffset (fieldOffset + index) byte b
+    in
+    List.foldl (\( index, byte ) b -> writeByteAt index byte b)
+        builder
+        (List.indexedMap Tuple.pair textBytes)
+
+
+writeBytesAtOffset : PointerOffset -> Int -> Bytes -> Builder -> Builder
+writeBytesAtOffset targetOffset offset bytes builder =
+    let
+        width =
+            Bytes.width bytes
+
+        decoder =
+            BD.loop ( 0, [] ) (decodeAllBytes width)
+    in
+    case BD.decode decoder bytes of
+        Just byteList ->
+            List.foldl (\( index, byte ) b ->
+                writeUInt8AtOffset targetOffset (offset + index) byte b
+            ) builder (List.indexedMap Tuple.pair byteList)
+
+        Nothing ->
+            builder
+
+
+writeBoolAtOffset : PointerOffset -> Int -> Int -> Bool -> Builder -> Builder
+writeBoolAtOffset structOffset byteOffset bitIndex value builder =
+    let
+        absoluteOffset =
+            structOffset.offset + byteOffset
+
+        segment =
+            Dict.get structOffset.segmentId builder.segments
+                |> Maybe.withDefault emptySegment
+
+        currentByte =
+            Array.get absoluteOffset segment.data |> Maybe.withDefault 0
+
+        bitMask =
+            Bitwise.shiftLeftBy bitIndex 1
+
+        newByte =
+            if value then
+                Bitwise.or currentByte bitMask
+
+            else
+                Bitwise.and currentByte (Bitwise.complement bitMask)
+
+        newData =
+            Array.set absoluteOffset newByte segment.data
+
+        newSegment =
+            { segment | data = newData }
+
+        newBuilder =
+            { builder | segments = Dict.insert structOffset.segmentId newSegment builder.segments }
+    in
+    newBuilder
+
+
+writeListPointerHelper : PointerOffset -> Int -> PointerOffset -> Int -> Int -> Int -> Int -> Bool -> Builder -> Builder
+writeListPointerHelper structOffset fieldOffset targetOffset elementType elementCount dataWords pointerWords isComposite builder =
+    let
+        offsetDiff =
+            targetOffset.offset - (structOffset.offset + fieldOffset + wordSize)
+
+        offsetWords =
+            offsetDiff // wordSize
+
+        maskedOffsetWords =
+            Bitwise.and offsetWords 0x3FFFFFFF
+
+        low32 =
+            Bitwise.or (Bitwise.shiftLeftBy 2 maskedOffsetWords) 1
+
+        high32 =
+            if isComposite then
+                let
+                    totalWords =
+                        elementCount * (dataWords + pointerWords)
+                in
+                Bitwise.or (Bitwise.shiftLeftBy 3 totalWords) 7
+
+            else
+                Bitwise.or
+                    (Bitwise.shiftLeftBy 3 elementCount)
+                    (Bitwise.and elementType 0x07)
+    in
+    writeUInt64 structOffset fieldOffset { high = high32, low = low32 } builder
+
+
+writeListPointerWithInfo : PointerOffset -> Int -> PointerOffset -> ListInfo -> Builder -> Builder
+writeListPointerWithInfo structOffset fieldOffset targetOffset listInfo builder =
+    writeListPointerHelper structOffset
+        fieldOffset
+        targetOffset
+        listInfo.elementType
+        listInfo.elementCount
+        listInfo.dataWords
+        listInfo.pointerWords
+        listInfo.isComposite
+        builder
+
+
+finalize : Builder -> Bytes
+finalize builder =
+    let
+        segments =
+            Dict.values builder.segments
+
+        segmentCount =
+            List.length segments
+
+        -- Cap'n Proto 消息头
+        header =
+            [ BE.unsignedInt32 Bytes.LE (segmentCount - 1) -- 段数量 - 1
+            ]
+                ++ List.map (\segment -> BE.unsignedInt32 Bytes.LE (segment.size // 8)) segments
+
+        -- 每个段的大小（字数）
+        -- 如果头部不是8字节对齐，添加填充
+        headerPadding =
+            if Bitwise.and 1 (1 + segmentCount) == 0 then
+                []
+
+            else
+                [ BE.unsignedInt32 Bytes.LE 0 ]
+
+        -- 段数据
+        segmentData =
+            List.map
+                (\segment ->
+                    let
+                        bytes =
+                            Array.toList segment.data |> List.map BE.unsignedInt8
+                    in
+                    BE.sequence bytes
+                )
+                segments
+    in
+    BE.encode (BE.sequence (header ++ headerPadding ++ segmentData))
+
+
+{-| 直接从 Builder 获取第一个段的原始字节数据，不添加任何消息头
+-}
+builderSegmentToBytes : Builder -> Bytes
+builderSegmentToBytes builder =
+    case Dict.get 0 builder.segments of
+        Just segment ->
+            segment.data
+                |> Array.slice 0 segment.size
+                -- 只提取实际写入的部分
+                |> Array.toList
+                |> List.map BE.unsignedInt8
+                |> BE.sequence
+                |> BE.encode
+
+        Nothing ->
+            emptyBytes
+
+
+
+-- 没有段时返回空字节
+-- 解码相关类型
+
+
+type alias Reader =
+    { bytes : Bytes
+    , baseOffset : Int
+    }
+
+
+
+-- 创建读取器
+
+
+createReader : Bytes -> Reader
+createReader bytes =
+    let
+        -- 简化：假设只有一个段
+        headerSize =
+            wordSize
+
+        -- 读取根指针，获取根对象位置
+        rootPointerOffset =
+            headerSize
+    in
+    case readPointer { bytes = bytes, baseOffset = rootPointerOffset } 0 of
+        Just info ->
+            info.target
+
+        Nothing ->
+            { bytes = bytes, baseOffset = headerSize + wordSize }
+
+
+
+-- 基础读取函数
+
+
+readUInt8 : Reader -> Int -> Maybe Int
+readUInt8 reader offset =
+    let
+        decoder =
+            BD.unsignedInt8
+
+        skipDecoder =
+            BD.bytes (reader.baseOffset + offset)
+    in
+    BD.decode (skipDecoder |> BD.andThen (\_ -> decoder)) reader.bytes
+
+
+readUInt16 : Reader -> Int -> Maybe Int
+readUInt16 reader offset =
+    let
+        decoder =
+            BD.unsignedInt16 Bytes.LE
+
+        skipDecoder =
+            BD.bytes (reader.baseOffset + offset)
+    in
+    BD.decode (skipDecoder |> BD.andThen (\_ -> decoder)) reader.bytes
+
+
+readUInt32 : Reader -> Int -> Maybe Int
+readUInt32 reader offset =
+    let
+        decoder =
+            BD.unsignedInt32 Bytes.LE
+
+        skipDecoder =
+            BD.bytes (reader.baseOffset + offset)
+    in
+    BD.decode (skipDecoder |> BD.andThen (\_ -> decoder)) reader.bytes
+
+
+{-| Read a capability pointer from a reader at the given byte offset.
+Returns the capability table index if the pointer type is capability
+(type = 3, low 2 bits = 0b11), or Nothing otherwise.
+
+In Cap'n Proto wire format, a capability pointer is encoded as:
+  low 2 bits   = 0b11 (type = capability)
+  bits 2..31   = capability table index
+-}
+readCapIndex : Reader -> Int -> Maybe Int
+readCapIndex reader offset =
+    readUInt32 reader offset
+        |> Maybe.andThen
+            (\word ->
+                if Bitwise.and word 0x3 == 0x3 then
+                    Just (Bitwise.shiftRightZfBy 2 word)
+
+                else
+                    Nothing
+            )
+
+
+readUInt64 : Reader -> Int -> Maybe Word64
+readUInt64 reader offset =
+    let
+        decoder =
+            BD.map2 (\low high -> Word64 high low)
+                (BD.unsignedInt32 Bytes.LE)
+                (BD.unsignedInt32 Bytes.LE)
+
+        skipDecoder =
+            BD.bytes (reader.baseOffset + offset)
+    in
+    BD.decode (skipDecoder |> BD.andThen (\_ -> decoder)) reader.bytes
+
+
+readFloat32 : Reader -> Int -> Maybe Float
+readFloat32 reader offset =
+    let
+        decoder =
+            BD.float32 Bytes.LE
+
+        skipDecoder =
+            BD.bytes (reader.baseOffset + offset)
+    in
+    BD.decode (skipDecoder |> BD.andThen (\_ -> decoder)) reader.bytes
+
+
+readFloat64 : Reader -> Int -> Maybe Float
+readFloat64 reader offset =
+    let
+        decoder =
+            BD.float64 Bytes.LE
+
+        skipDecoder =
+            BD.bytes (reader.baseOffset + offset)
+    in
+    BD.decode (skipDecoder |> BD.andThen (\_ -> decoder)) reader.bytes
+
+
+{-| 布尔读取函数
+-}
+readBool : Reader -> Int -> Int -> Maybe Bool
+readBool reader byteOffset bitOffset =
+    readUInt8 reader byteOffset
+        |> Maybe.map
+            (\byte ->
+                let
+                    mask =
+                        Bitwise.shiftLeftBy bitOffset 1
+                in
+                Bitwise.and byte mask /= 0
+            )
+
+
+{-| 指针读取函数
+-}
+readPointer : Reader -> Int -> Maybe PointerInfo
+readPointer reader offset =
+    readUInt64 reader offset
+        |> Maybe.andThen
+            (\pointerValue ->
+                if pointerValue.low == 0 && pointerValue.high == 0 then
+                    Just
+                        { target = reader
+                        , pointerType = NullPointer
+                        , dataWords = 0
+                        , pointerWords = 0
+                        , elementType = 0
+                        , elementCount = 0
+                        , isComposite = False
+                        }
+
+                else
+                    let
+                        low =
+                            pointerValue.low
+
+                        high =
+                            pointerValue.high
+
+                        -- 提取指针类型（低2位）
+                        pointerType =
+                            Bitwise.and low 3
+
+                        -- 提取偏移量（30位有符号整数）
+                        offsetWords =
+                            Bitwise.shiftRightZfBy 2 low
+                                -- 无符号右移2位
+                                |> signExtend30Bit
+
+                        -- 符号扩展为32位有符号整数
+                        -- 计算目标位置（字节）
+                        targetOffset =
+                            reader.baseOffset + offset + 8 + (offsetWords * 8)
+                    in
+                    if pointerType == 0 then
+                        -- 结构体指针
+                        let
+                            dataWords =
+                                Bitwise.and high 0xFFFF
+
+                            pointerWords =
+                                Bitwise.shiftRightZfBy 16 high
+                        in
+                        Just
+                            { target = { reader | baseOffset = targetOffset }
+                            , pointerType = StructPointer
+                            , dataWords = dataWords
+                            , pointerWords = pointerWords
+                            , elementType = 0
+                            , elementCount = 0
+                            , isComposite = False
+                            }
+
+                    else if pointerType == 1 then
+                        -- 列表指针
+                        let
+                            elementType =
+                                Bitwise.and high 0x07
+
+                            elementCount =
+                                Bitwise.shiftRightZfBy 3 high
+
+                            isComposite =
+                                elementType == 7
+                        in
+                        if isComposite then
+                            -- 复合列表需要读取标签字
+                            readUInt64 { reader | baseOffset = targetOffset } 0
+                                |> Maybe.map
+                                    (\tag ->
+                                        let
+                                            -- 标签字布局同结构体指针
+                                            dataWords =
+                                                Bitwise.and tag.high 0xFFFF
+
+                                            pointerWords =
+                                                Bitwise.shiftRightZfBy 16 tag.high
+                                        in
+                                        { target = { reader | baseOffset = targetOffset + wordSize } -- 跳过标签字
+                                        , pointerType = ListPointer
+                                        , dataWords = dataWords
+                                        , pointerWords = pointerWords
+                                        , elementType = elementType
+                                        , elementCount = elementCount // (dataWords + pointerWords)
+                                        , isComposite = True
+                                        }
+                                    )
+
+                        else
+                            Just
+                                { target = { reader | baseOffset = targetOffset }
+                                , pointerType = ListPointer
+                                , dataWords = 0
+                                , pointerWords = 0
+                                , elementType = elementType
+                                , elementCount = elementCount
+                                , isComposite = False
+                                }
+
+                    else
+                        Nothing
+            )
+
+
+{-| 文本读取函数
+-}
+readText : Reader -> Int -> Maybe String
+readText reader offset =
+    readPointer reader offset
+        |> Maybe.andThen extractTextFromInfo
+
+
+extractTextFromInfo : PointerInfo -> Maybe String
+extractTextFromInfo info =
+    case info.pointerType of
+        NullPointer ->
+            Just ""
+
+        ListPointer ->
+            if info.elementType == 2 then
+                let
+                    -- 文本长度（不包括null终止符）
+                    contentLength =
+                        info.elementCount - 1
+
+                    -- 文本数据起始位置
+                    textStartOffset =
+                        info.target.baseOffset
+
+                    -- 创建跳过偏移量的解码器
+                    textDecoder =
+                        BD.bytes textStartOffset
+                            |> BD.andThen (\_ -> BD.string contentLength)
+                in
+                BD.decode textDecoder info.target.bytes
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+{-| 数据读取函数
+-}
+readData : Reader -> Int -> Maybe Bytes
+readData reader offset =
+    readPointer reader offset
+        |> Maybe.andThen extractDataFromInfo
+
+
+extractDataFromInfo : PointerInfo -> Maybe Bytes
+extractDataFromInfo info =
+    case info.pointerType of
+        NullPointer ->
+            Just emptyBytes
+
+        ListPointer ->
+            if info.elementType == 2 then
+                let
+                    contentLength =
+                        info.elementCount
+                in
+                Just (extractBytesFromOffset info.target.bytes info.target.baseOffset contentLength)
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+{-| 列表读取函数
+-}
+readList : Reader -> Int -> (Reader -> Int -> Maybe a) -> Maybe (List a)
+readList reader offset elementDecoder =
+    readPointer reader offset
+        |> Maybe.andThen
+            (\info ->
+                case info.pointerType of
+                    NullPointer ->
+                        Just []
+
+                    ListPointer ->
+                        let
+                            elementSize =
+                                elementSizeOf info
+
+                            elementReader index =
+                                let
+                                    elementOffset =
+                                        if info.isComposite then
+                                            -- Composite lists have an extra tag word
+                                            info.target.baseOffset + 8 + index * elementSize
+
+                                        else
+                                            -- Normal lists have content immediately after header
+                                            info.target.baseOffset + 8 + index * elementSize
+                                in
+                                { bytes = info.target.bytes
+                                , baseOffset = elementOffset
+                                }
+                        in
+                        List.range 0 (info.elementCount - 1)
+                            |> List.map (\i -> elementDecoder (elementReader i) 0)
+                            |> combineResults
+
+                    _ ->
+                        Nothing
+            )
+
+
+{-| 读取 Int32 列表
+-}
+readInt32List : Reader -> Int -> Maybe (List Int)
+readInt32List reader offset =
+    readList reader offset (\itemReader _ -> readUInt32 itemReader 0)
+
+
+{-| 读取 Float 列表
+-}
+readFloat32List : Reader -> Int -> Maybe (List Float)
+readFloat32List reader offset =
+    readList reader offset (\itemReader _ -> readFloat32 itemReader 0)
+
+
+readFloat64List : Reader -> Int -> Maybe (List Float)
+readFloat64List reader offset =
+    readList reader offset (\itemReader _ -> readFloat64 itemReader 0)
+
+
+{-| 读取 Text 列表
+-}
+readTextList : Reader -> Int -> Maybe (List String)
+readTextList reader offset =
+    readList reader offset (\itemReader _ -> readText itemReader 0)
+
+
+readEnum : Reader -> Int -> Maybe Int
+readEnum reader offset =
+    readUInt16 reader offset
+
+
+readAnyPointer : Reader -> Int -> Maybe AnyPointer
+readAnyPointer reader offset =
+    readPointer reader offset
+        |> Maybe.map (\info -> AnyPointerDecoded info)
+
+
+{-| 更通用的结构体指针访问
+-}
+getStructPointer : Reader -> Int -> Maybe ( Reader, Int, Int )
+getStructPointer reader pointerOffset =
+    readPointer reader pointerOffset
+        |> Maybe.andThen
+            (\info ->
+                case info.pointerType of
+                    StructPointer ->
+                        Just ( info.target, info.dataWords, info.pointerWords )
+
+                    _ ->
+                        Nothing
+            )
+
+
+getListPointer : Reader -> Int -> Maybe ( Reader, ( Int, Int, Int ) )
+getListPointer reader pointerOffset =
+    readPointer reader pointerOffset
+        |> Maybe.andThen
+            (\info ->
+                case info.pointerType of
+                    ListPointer ->
+                        Just ( info.target, ( info.elementType, info.elementCount, elementSizeOf info ) )
+
+                    NullPointer ->
+                        -- 返回空列表信息：元素类型0，数量0，大小0
+                        Just ( reader, ( 0, 0, 0 ) )
+
+                    _ ->
+                        Nothing
+            )
+
+
+
+-- 更通用的列表访问
+
+
+getListLength : Reader -> Int -> Maybe Int
+getListLength reader pointerOffset =
+    readPointer reader pointerOffset
+        |> Maybe.map
+            (\info ->
+                case info.pointerType of
+                    NullPointer ->
+                        0
+
+                    _ ->
+                        info.elementCount
+            )
+
+
+getListElementAt : Reader -> Int -> Int -> Maybe Reader
+getListElementAt reader pointerOffset index =
+    getListPointer reader pointerOffset
+        |> Maybe.andThen
+            (\( listReader, ( elementType, elementCount, elementSize ) ) ->
+                if index < 0 || index >= elementCount then
+                    Nothing
+
+                else
+                    let
+                        contentOffset =
+                            listReader.baseOffset
+                    in
+                    case elementType of
+                        0 ->
+                            -- Pointer list
+                            Just { reader | baseOffset = contentOffset + index * 8 }
+
+                        1 ->
+                            -- Int32 list
+                            Just { reader | baseOffset = contentOffset + index * 4 }
+
+                        2 ->
+                            -- Byte list
+                            Just { reader | baseOffset = contentOffset + index * 1 }
+
+                        3 ->
+                            -- 2-byte list
+                            Just { reader | baseOffset = contentOffset + index * 2 }
+
+                        4 ->
+                            -- 4-byte list
+                            Just { reader | baseOffset = contentOffset + index * 4 }
+
+                        5 ->
+                            -- 8-byte list
+                            Just { reader | baseOffset = contentOffset + index * 8 }
+
+                        6 ->
+                            -- Pointer list (same as 0)
+                            Just { reader | baseOffset = contentOffset + index * 8 }
+
+                        7 ->
+                            -- Composite list
+                            let
+                                elementOffset =
+                                    contentOffset + index * elementSize
+                            in
+                            Just { reader | baseOffset = elementOffset }
+
+                        _ ->
+                            Nothing
+            )
+
+
+getListItems : Reader -> Int -> Maybe Reader
+getListItems reader pointerOffset =
+    getListPointer reader pointerOffset
+        |> Maybe.map
+            (\( listReader, ( elementType, _, _ ) ) ->
+                case elementType of
+                    7 ->
+                        -- Composite list (skip tag)
+                        { reader | baseOffset = listReader.baseOffset + 8 + 8 }
+
+                    _ ->
+                        -- All other lists (skip header)
+                        { reader | baseOffset = listReader.baseOffset + 8 }
+            )
+
+
+getListItem : Reader -> Int -> (Reader -> Maybe a) -> Maybe a
+getListItem reader index decoder =
+    getListElementAt reader 0 index
+        |> Maybe.andThen decoder
+
+
+{-| 辅助函数：组合 Maybe 结果
+-}
+combineResults : List (Maybe a) -> Maybe (List a)
+combineResults list =
+    List.foldr (Maybe.map2 (::)) (Just []) list
+
+
+
+-- Utility functions
+
+
+{-| 30位有符号整数符号扩展为32位
+-}
+signExtend30Bit : Int -> Int
+signExtend30Bit value =
+    -- 检查符号位（第29位）
+    if Bitwise.and value 0x20000000 /= 0 then
+        -- 负数：减去2^30进行符号扩展
+        value - 0x40000000
+
+    else
+        -- 正数：直接使用
+        value
+
+
+{-| 计算列表元素大小（字节）
+-}
+elementSizeOf : PointerInfo -> Int
+elementSizeOf info =
+    case info.elementType of
+        -- Void
+        0 ->
+            0
+
+        -- Bit
+        1 ->
+            1
+
+        -- Byte
+        2 ->
+            1
+
+        -- 2-byte
+        3 ->
+            2
+
+        -- 4-byte
+        4 ->
+            4
+
+        -- 8-byte (non-pointer)
+        5 ->
+            8
+
+        -- 8-byte (pointer)
+        6 ->
+            8
+
+        -- Composite
+        7 ->
+            (info.dataWords + info.pointerWords) * 8
+
+        _ ->
+            0
+
+
+dataSizeOf : PointerInfo -> Int
+dataSizeOf info =
+    case info.pointerType of
+        StructPointer ->
+            (info.dataWords + info.pointerWords) * wordSize
+
+        ListPointer ->
+            if info.isComposite then
+                -- 复合列表：标签字 + 元素数据
+                wordSize + (info.dataWords + info.pointerWords) * info.elementCount * wordSize
+
+            else
+                -- 非复合列表：只有元素数据
+                let
+                    contentSize =
+                        info.elementCount * elementSizeOf info
+                in
+                -- 添加8字节对齐填充
+                ((contentSize + 7) // 8) * 8
+
+        _ ->
+            0
+
+
+{-| Applicative 组合辅助函数
+-}
+andMap : Result String a -> Result String (a -> b) -> Result String b
+andMap resultArg resultFunc =
+    Result.map2 (\f arg -> f arg) resultFunc resultArg
+
+
+{-| 辅助函数：将 Maybe 转换为 Result
+-}
+requireField : String -> Maybe a -> Result String a
+requireField fieldName maybeValue =
+    case maybeValue of
+        Just value ->
+            Ok value
+
+        Nothing ->
+            Err ("Missing field: " ++ fieldName)
+
+
+{-| 处理 Result 列表
+-}
+traverseResult : (a -> Result String b) -> List a -> Result String (List b)
+traverseResult f list =
+    List.foldl
+        (\item acc ->
+            case acc of
+                Ok accList ->
+                    case f item of
+                        Ok value ->
+                            Ok (value :: accList)
+
+                        Err err ->
+                            Err err
+
+                Err err ->
+                    Err err
+        )
+        (Ok [])
+        list
+        |> Result.map List.reverse
+
+
+{-| 处理 Maybe 列表
+-}
+traverseMaybe : (a -> Maybe b) -> List a -> Maybe (List b)
+traverseMaybe f list =
+    List.foldl
+        (\item acc ->
+            acc
+                |> Maybe.andThen
+                    (\accList ->
+                        f item |> Maybe.map (\x -> x :: accList)
+                    )
+        )
+        (Just [])
+        list
+        |> Maybe.map List.reverse
+
+
+bytesToHexdump : Bytes.Bytes -> String
+bytesToHexdump bytes =
+    let
+        width =
+            Bytes.width bytes
+
+        decoder =
+            BD.loop ( 0, [] ) (decodeAllBytes width)
+    in
+    case BD.decode decoder bytes of
+        Just byteList ->
+            formatHexdump byteList
+
+        Nothing ->
+            "Failed to decode bytes"
+
+
+decodeAllBytes :
+    Int
+    -> ( Int, List Int )
+    ->
+        BD.Decoder
+            (BD.Step
+                ( Int
+                , List Int
+                )
+                (List Int)
+            )
+decodeAllBytes totalWidth ( offset, acc ) =
+    if offset >= totalWidth then
+        BD.succeed (BD.Done (List.reverse acc))
+
+    else
+        BD.map (\byte -> BD.Loop ( offset + 1, byte :: acc )) BD.unsignedInt8
+
+
+formatHexdump : List Int -> String
+formatHexdump bytes =
+    bytes
+        |> List.indexedMap Tuple.pair
+        |> groupsOf 16
+        |> List.map formatHexLine
+        |> String.join "\n"
+
+
+groupsOf : Int -> List a -> List (List a)
+groupsOf n list =
+    case list of
+        [] ->
+            []
+
+        _ ->
+            List.take n list :: groupsOf n (List.drop n list)
+
+
+formatHexLine : List ( Int, Int ) -> String
+formatHexLine indexedBytes =
+    let
+        offset =
+            case List.head indexedBytes of
+                Just ( i, _ ) ->
+                    String.padLeft 8 '0' (intToHex i)
+
+                Nothing ->
+                    "00000000"
+
+        -- 将字节分成两组：前8个和后8个
+        firstGroup =
+            List.take 8 indexedBytes
+
+        secondGroup =
+            List.drop 8 indexedBytes
+
+        -- 分别转换两组
+        firstHex =
+            firstGroup |> List.map (Tuple.second >> byteToHex) |> String.join " "
+
+        secondHex =
+            secondGroup |> List.map (Tuple.second >> byteToHex) |> String.join " "
+
+        -- 组合两组，中间用两个空格分隔（这样组间会有一个额外空格）
+        hexLine =
+            if List.isEmpty secondGroup then
+                firstHex
+
+            else
+                firstHex ++ "  " ++ secondHex
+
+        hexPart =
+            hexLine |> String.padRight 47 ' '
+
+        asciiPart =
+            indexedBytes
+                |> List.map (Tuple.second >> byteToAscii)
+                |> String.join ""
+    in
+    offset ++ "  " ++ hexPart ++ "  |" ++ asciiPart ++ "|"
+
+
+byteToHex : Int -> String
+byteToHex n =
+    String.padLeft 2 '0' (intToHex n)
+
+
+intToHex : Int -> String
+intToHex n =
+    if n == 0 then
+        "0"
+
+    else
+        intToHexHelper n ""
+
+
+intToHexHelper : Int -> String -> String
+intToHexHelper n acc =
+    if n == 0 then
+        acc
+
+    else
+        let
+            digit =
+                Bitwise.and n 15
+
+            char =
+                if digit < 10 then
+                    String.fromInt digit
+
+                else
+                    String.fromChar (Char.fromCode (55 + digit))
+        in
+        intToHexHelper (n // 16) (char ++ acc)
+
+
+byteToAscii : Int -> String
+byteToAscii n =
+    if n >= 32 && n <= 126 then
+        String.fromChar (Char.fromCode n)
+
+    else
+        "."

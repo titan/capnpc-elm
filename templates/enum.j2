@@ -1,0 +1,20 @@
+type Entity
+    {% for variant in variants -%}
+    {% if loop.first %}={% else %}|{% endif %} {{ variant.name|to_upper_camel_case }}
+    {% endfor %}
+
+toCode : Entity -> Int
+toCode variant =
+    case variant of
+        {% for variant in variants -%}
+        {{ variant.name|to_upper_camel_case }} -> {{ variant.ordinal }}
+        {% endfor %}
+
+fromCode : Int -> Maybe Entity
+fromCode code =
+    case code of
+        {% for variant in variants -%}
+        {{ variant.ordinal }} -> Just {{ variant.name|to_upper_camel_case }}
+        {% endfor %}
+        _ -> Nothing
+

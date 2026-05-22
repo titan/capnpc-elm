@@ -1,0 +1,293 @@
+{#
+  WebSocket Transport Template for capnpc-elm3
+  
+  This template generates the Rpc.WebSocket module that provides:
+  - WebSocket connection management
+  - Length-prefixed message framing
+  - Connection state tracking
+  - Port-based Elm/JS interop
+  
+  Reference: capnp-typescript/src/rpc/websocket-transport.ts
+#}
+port module Rpc.WebSocket exposing
+    ( Connection
+    , ConnectionState(..)
+    , Frame
+    , connect
+    , disconnect
+    , frameMessage
+    , receive
+    , send
+    , subscriptions
+    , unframeMessage
+    )
+
+import Bitwise
+import Bytes exposing (Bytes)
+import Bytes.Decode as BD
+import Bytes.Encode as BE
+
+
+{-| Connection state tracking
+-}
+type ConnectionState
+    = Connecting
+    | Connected
+    | Disconnected
+    | Error String
+
+
+{-| Connection handle
+-}
+type alias Connection =
+    { url : String
+    , state : ConnectionState
+    }
+
+
+{-| Frame structure for length-prefixed messages
+-}
+type alias Frame =
+    { length : Int
+    , data : Bytes
+    }
+
+
+
+-- PORTS
+
+
+{-| Connect to WebSocket server
+Sends: { "url": <string> }
+-}
+port wsConnect : { url : String } -> Cmd msg
+
+
+{-| Disconnect from WebSocket server
+Sends: {}
+-}
+port wsDisconnect : {} -> Cmd msg
+
+
+{-| Send binary data through WebSocket
+Sends: { "data": [<int>, ...] }
+-}
+port wsSend : { data : List Int } -> Cmd msg
+
+
+{-| Receive connection state changes
+Receives: { "state": "connected" | "disconnected" | "error", "error": <string?> }
+-}
+port wsConnectionState : ({ state : String, error : Maybe String } -> msg) -> Sub msg
+
+
+{-| Receive framed binary data
+Receives: { "data": [<int>, ...] }
+-}
+port wsReceive : ({ data : List Int } -> msg) -> Sub msg
+
+
+
+-- PUBLIC API
+
+
+{-| Initiate WebSocket connection
+-}
+connect : String -> (Result String Connection -> msg) -> ( Connection, Cmd msg )
+connect url onResult =
+    ( { url = url, state = Connecting }
+    , wsConnect { url = url }
+    )
+
+
+{-| Disconnect from WebSocket server
+-}
+disconnect : Connection -> ( Connection, Cmd msg )
+disconnect conn =
+    ( { conn | state = Disconnected }
+    , wsDisconnect {}
+    )
+
+
+{-| Send framed message through WebSocket
+-}
+send : Connection -> Bytes -> Result String ( Connection, Cmd msg )
+send conn data =
+    case conn.state of
+        Connected ->
+            let
+                frame =
+                    frameMessage data
+            in
+            Ok ( conn, wsSend { data = bytesToList frame } )
+
+        Connecting ->
+            Err "WebSocket not connected yet"
+
+        Disconnected ->
+            Err "WebSocket disconnected"
+
+        Error err ->
+            Err ("WebSocket error: " ++ err)
+
+
+{-| Receive unframed message data
+-}
+receive : { data : List Int } -> Result String Bytes
+receive { data } =
+    listToBytes data
+        |> Result.andThen unframeMessage
+
+
+{-| Subscribe to WebSocket events
+-}
+subscriptions :
+    { onConnected : msg
+    , onDisconnected : Maybe String -> msg
+    , onError : String -> msg
+    , onMessage : Result String Bytes -> msg
+    }
+    -> Sub msg
+subscriptions config =
+    Sub.batch
+        [ wsConnectionState
+            (\{ state, error } ->
+                case state of
+                    "connected" ->
+                        config.onConnected
+
+                    "disconnected" ->
+                        config.onDisconnected error
+
+                    "error" ->
+                        config.onError (error |> Maybe.withDefault "Unknown error")
+
+                    _ ->
+                        config.onError ("Unknown state: " ++ state)
+            )
+        , wsReceive
+            (\data ->
+                config.onMessage (receive data)
+            )
+        ]
+
+
+
+-- FRAMING
+
+
+{-| Frame a message with length prefix
+
+Format: [4 bytes: length (little-endian uint32)] [N bytes: message data]
+
+-}
+frameMessage : Bytes -> Bytes
+frameMessage messageData =
+    let
+        length =
+            Bytes.width messageData
+
+        lengthBytes =
+            BE.encode
+                (BE.sequence
+                    [ BE.unsignedInt32 Bytes.LE length
+                    ]
+                )
+
+        frameEncoder =
+            BE.sequence
+                [ BE.bytes lengthBytes
+                , BE.bytes messageData
+                ]
+    in
+    BE.encode frameEncoder
+
+
+{-| Unframe a length-prefixed message
+
+Returns the message data without the length prefix.
+
+-}
+unframeMessage : Bytes -> Result String Bytes
+unframeMessage framedData =
+    let
+        totalLength =
+            Bytes.width framedData
+    in
+    if totalLength < 4 then
+        Err "Frame too short for length prefix"
+
+    else
+        let
+            lengthDecoder =
+                BD.unsignedInt32 Bytes.LE
+
+            dataDecoder length =
+                BD.bytes 4
+                    |> BD.andThen (\_ -> BD.bytes length)
+        in
+        case BD.decode lengthDecoder framedData of
+            Just messageLength ->
+                if totalLength < 4 + messageLength then
+                    Err ("Frame incomplete: expected " ++ String.fromInt (4 + messageLength) ++ " bytes, got " ++ String.fromInt totalLength)
+
+                else
+                    case BD.decode (dataDecoder messageLength) framedData of
+                        Just messageData ->
+                            Ok messageData
+
+                        Nothing ->
+                            Err "Failed to decode message data"
+
+            Nothing ->
+                Err "Failed to decode frame length"
+
+
+
+-- UTILITIES
+
+
+{-| Convert Bytes to List Int for port communication
+-}
+bytesToList : Bytes -> List Int
+bytesToList bytes =
+    let
+        width =
+            Bytes.width bytes
+
+        decoder =
+            BD.loop ( 0, [] ) (decodeAllBytes width)
+    in
+    case BD.decode decoder bytes of
+        Just byteList ->
+            byteList
+
+        Nothing ->
+            []
+
+
+decodeAllBytes :
+    Int
+    -> ( Int, List Int )
+    -> BD.Decoder (BD.Step ( Int, List Int ) (List Int))
+decodeAllBytes totalWidth ( offset, acc ) =
+    if offset >= totalWidth then
+        BD.succeed (BD.Done (List.reverse acc))
+
+    else
+        BD.map (\byte -> BD.Loop ( offset + 1, byte :: acc )) BD.unsignedInt8
+
+
+{-| Convert List Int to Bytes from port communication
+-}
+listToBytes : List Int -> Result String Bytes
+listToBytes intList =
+    if List.isEmpty intList then
+        Ok (BE.encode (BE.sequence []))
+
+    else
+        let
+            encoders =
+                List.map BE.unsignedInt8 intList
+        in
+        Ok (BE.encode (BE.sequence encoders))

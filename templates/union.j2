@@ -1,0 +1,184 @@
+type Entity =
+    {% for branch in branches -%}
+    {% if !loop.first %}|{% endif %} {{ branch.name|to_upper_camel_case }} {{ branch.elm_type|elm_type_str }}
+    {% endfor %}
+
+dataWords : Int
+dataWords =
+    {{ module.data_words }}
+
+pointerWords : Int
+pointerWords =
+    {{ module.pointer_words }}
+
+
+encode : Entity -> Capnproto.StructLayout
+encode entity =
+    { dataEncoders =
+        [
+            case entity of
+            {% for branch in branches %}
+                {{ branch.name|to_upper_camel_case }} {% if !(branch.elm_type|is_void_type) %}_{% endif %} ->
+                \soffset builder ->
+                    Capnproto.writeUInt16 soffset {{ module.discriminant_offset * 2 }} {{ branch.discriminant }} builder
+            {% endfor %}
+            {% if data_branches.len() > 0 %},
+            case entity of
+                {% for branch in data_branches %}
+                    {% if branch.elm_type|is_boolean_type %}
+                {{ branch.name|to_upper_camel_case}} value ->
+                    \soffset builder ->
+                        Capnproto.writeBool soffset {{ branch.offset / 8 }} {{ branch.offset % 8 }} value builder
+                    {% else if branch.elm_type|is_integer_type || branch.elm_type|is_float_type %}
+                {{ branch.name|to_upper_camel_case }} value ->
+                    \soffset builder ->
+                        Capnproto.write{{ branch.elm_type|elm_write_type }} soffset {{ branch.offset * branch.elm_type|elm_type_bytewidth }} value builder
+                    {% else if branch.elm_type|is_enum_ref %}
+                {{ branch.name|to_upper_camel_case }} value ->
+                    \soffset builder ->
+                        Capnproto.writeUInt16 soffset {{ branch.offset * 2 }} ({{ branch.elm_type|elm_type_module_str }}.toCode value builder
+                        {% endif %}
+                {% endfor %}
+                {% if branches|data_branches_count + branches|pointer_branches_count < branches.len() || branches|pointer_branches_count > 0 %}
+                _ ->
+                    \_ builder -> builder
+                {% endif %}
+            {% endif %}
+        ]
+    , pointerEncoders =
+        [
+            {% if pointer_branches.len() > 0 %}
+            case entity of
+                {% for branch in pointer_branches %}
+                    {% if branch.elm_type|is_text_type %}
+                {{ branch.name|to_upper_camel_case }} value ->
+                    Capnproto.encodeTextPointer value
+                    {% else if branch.elm_type|is_struct_ref %}
+                {{ branch.name|to_upper_camel_case }} value ->
+                    \soffset ptrOffset builder ->
+                        Capnproto.encodeStructPointer
+                            value
+                            {{ branch.elm_type|elm_type_module_str }}.encode
+                            {{ branch.elm_type|elm_type_module_str }}.dataWords
+                            {{ branch.elm_type|elm_type_module_str }}.pointerWords
+                            soffset
+                            ptrOffset
+                            builder
+                    {% else if branch.elm_type|is_list_type %}
+                {{ branch.name|to_upper_camel_case }} value ->
+                    \soffset ptrOffset builder ->
+                        Capnproto.encodeListPointer
+                            (Capnproto.encodeStructList
+                                {{ branch.elm_type|strip_list_type|elm_type_module_str }}.encode
+                                {{ branch.elm_type|strip_list_type|elm_type_module_str }}.dataWords
+                                {{ branch.elm_type|strip_list_type|elm_type_module_str }}.pointerWords)
+                            value
+                            {{ branch.elm_type|elm_type_module_str }}.encode
+                            {{ branch.elm_type|elm_type_module_str }}.dataWords
+                            {{ branch.elm_type|elm_type_module_str }}.pointerWords
+                            soffset
+                            ptrOffset
+                            builder
+                    {% else if branch.elm_type|is_anypointer_type %}
+                {{ branch.name|to_upper_camel_case }} value ->
+                    \soffset ptrOffset builder ->
+                        Capnproto.encodeAnyPointer value soffset ptrOffset builder
+                    {% endif %}
+                {% endfor %}
+                {% if branches|pointer_branches_count != branches.len() %}
+                _ ->
+                    \_ _ builder ->
+                        builder
+                {% endif %}
+            {% endif %}
+        ]
+    , dataWords = {{ module.data_words }}
+    , pointerWords = {{ module.pointer_words }}
+    }
+
+
+getWhich : Capnproto.Reader -> Maybe Int
+getWhich reader =
+    Capnproto.readUInt16 reader {{ module.discriminant_offset * 2 }}
+
+{% for branch in branches %}
+is{{ branch.name|to_upper_camel_case }} : Capnproto.Reader -> Bool
+is{{ branch.name|to_upper_camel_case }} reader =
+    case getWhich reader of
+        Just {{ branch.discriminant }} ->
+            True
+        _ ->
+            False
+
+{% if !(branch.elm_type|is_void_type) %}
+    {% if branch.elm_type|is_list_type %}
+get{{ branch.name|to_upper_camel_case }} : Capnproto.Reader -> Maybe ({{ branch.elm_type|elm_type_str }})
+    {% else %}
+get{{ branch.name|to_upper_camel_case }} : Capnproto.Reader -> Maybe {{ branch.elm_type|elm_type_str }}
+    {% endif %}
+get{{ branch.name|to_upper_camel_case }} reader =
+    if is{{ branch.name|to_upper_camel_case }} reader then
+        {% if branch.elm_type|is_boolean_type %}
+        Capnproto.readBool reader {{ branch.offset / 8 }} {{ branch.offset % 8 }}
+        {% else if branch.elm_type|is_integer_type %}
+        Capnproto.read{{ branch.elm_type|elm_read_type }} reader {{ branch.offset * branch.elm_type|elm_type_bytewidth }}
+        {% else if branch.elm_type|is_float_type %}
+        Capnproto.read{{ branch.elm_type|elm_read_type }} reader {{ branch.offset * branch.elm_type|elm_type_bytewidth }}
+        {% else if branch.elm_type|is_enum_ref %}
+        Capnproto.readUInt16 reader {{ branch.offset * 2 }}
+            |> Maybe.andThen {{ branch.elm_type|elm_type_module_str }}.fromCode
+        {% else if branch.elm_type|is_text_type %}
+        Capnproto.readText reader {{ (module.data_words + branch.offset) * 8 }}
+        {% else if branch.elm_type|is_struct_ref %}
+        Capnproto.getStructPointer reader {{ (module.data_words + branch.offset) * 8 }}
+            |> Maybe.map (\( r, _, _ ) -> r)
+            |> Maybe.andThen ({{ branch.elm_type|elm_type_module_str }}.decode >> Result.toMaybe)
+        {% else if branch.elm_type|is_list_type %}
+        get{{ branch.name|to_upper_camel_case}}Count reader
+            |> Maybe.andThen
+                (\count ->
+                    List.range 0 (count - 1)
+                        |> Capnproto.traverseMaybe
+                            (\index -> get{{ branch.name|to_upper_camel_case }}At reader index)
+                )
+        {% else if branch.elm_type|is_anypointer_type %}
+        Capnproto.readAnyPointer reader {{ (module.data_words + branch.offset) * 8 }}
+        {% else %}
+        Nothing
+        {% endif %}
+    else
+        Nothing
+
+    {% if branch.elm_type|is_list_type %}
+get{{ branch.name|to_upper_camel_case }}Count : Capnproto.Reader -> Maybe Int
+get{{ branch.name|to_upper_camel_case }}Count reader =
+    Capnproto.getListPointer reader {{ (module.data_words + branch.offset) * 8 }}
+        |> Maybe.map (\(_, (_, count, _)) -> count)
+
+get{{ branch.name|to_upper_camel_case }}At : Capnproto.Reader -> Int -> Maybe {{ branch.elm_type|strip_list_type|elm_type_str }}
+get{{ branch.name|to_upper_camel_case }}At reader index =
+    Capnproto.getListElementAt reader {{ (module.data_words + branch.offset) * 8 }} index
+        |> Maybe.andThen ({{ branch.elm_type|strip_list_type|elm_type_module_str }}.decode >> Result.toMaybe)
+    {% endif %}
+{% endif %}
+{% endfor %}
+
+decode : Capnproto.Reader -> Result String Entity
+decode reader =
+    case getWhich reader of
+        Just discriminant ->
+            case discriminant of
+            {% for branch in branches %}
+                {{ branch.discriminant }} ->
+                    {% if branch.elm_type|is_void_type %}
+                    Ok {{ branch.name|to_upper_camel_case }}
+                    {% else %}
+                    get{{ branch.name|to_upper_camel_case }} reader
+                        |> Result.fromMaybe ("Failed to decode branch {{ branch.name }}")
+                        |> Result.map {{ branch.name|to_upper_camel_case }}
+                    {% endif %}
+            {% endfor %}
+                _ ->
+                    Err ("Unknown discriminant: " ++ String.fromInt discriminant)
+        Nothing ->
+            Err "Failed to read discriminant"

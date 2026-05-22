@@ -1,0 +1,15 @@
+[package]
+name = "capnpc-elm"
+version = "0.3.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.96"
+askama = "0.12.1"
+capnp = "0.21.2"
+heck = "0.5.0"
+lazy_static = "1.5.0"
+
+[lib]
+name = "capnpc_elm"
+path = "src/lib.rs"

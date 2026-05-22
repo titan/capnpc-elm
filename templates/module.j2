@@ -1,0 +1,8 @@
+module {{ full_module_name }} exposing
+    ( {{ exports|join("\n    , ") }} )
+
+{% for import in module.imports %}
+import {{ import }}
+{% endfor %}
+
+{{ body }}

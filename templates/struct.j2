@@ -1,0 +1,553 @@
+{% for field in fields %}
+    {% if field.elm_type|is_union_type %}
+type Union {% for param in generic_params %}{{param}} {% endfor %}
+    {% for branch in field.elm_type|strip_union_branches %}
+    {% if loop.first %}={% else %}|{% endif %} {{ branch.name|to_upper_camel_case }} {{ branch.elm_type|parenthesize_if_needed }}
+    {% endfor %}
+    {% endif %}
+{% endfor %}
+
+{% if !generic_params.is_empty() %}{# 有泛型参数 #}
+type alias Entity {% for param in generic_params %}{{param}} {% endfor %} =
+{% else %}
+type alias Entity =
+{% endif %}
+    { {% for field in fields -%}
+    {{ field.name|escape_elm_keyword }} : {{ field.elm_type|elm_type_str }}{% if !loop.last %},{% endif %}
+    {% endfor %}
+    }
+
+dataWords : Int
+dataWords =
+    {{ module.data_words }}
+
+pointerWords : Int
+pointerWords =
+    {{ module.pointer_words }}
+
+{% if !generic_params.is_empty() %}{# 有泛型参数 #}
+encode : {% for param in generic_params %}({{ param }} -> Capnproto.AnyPointer) -> {% endfor %}Entity {% for param in generic_params %}{{ param }} {% endfor %}-> Capnproto.StructLayout
+{% else %}
+encode : Entity -> Capnproto.StructLayout
+{% endif %}
+encode {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ param }}Encoder {% endfor %}{% endif %}entity =
+    { dataEncoders =
+        [
+            {% if has_union %}{# 有 Union 类型 #}
+            case entity.{{ union_field.unwrap().name|escape_elm_keyword }} of
+                {% for branch in union_field.unwrap().elm_type|strip_union_branches %}
+                    {% if union_field.unwrap().elm_type|is_union_type %}
+                {{ branch.name|to_upper_camel_case }} {% if !(branch.elm_type|is_void_type) %}_{% endif %} ->
+                    {% else %}
+                {{ union_field.unwrap().elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} {% if !(branch.elm_type|is_void_type) %}_{% endif %} ->
+                    {% endif %}
+                    \soffset builder ->
+                        Capnproto.writeUInt16 soffset {{ module.discriminant_offset * 2 }} {{ branch.discriminant }} builder
+                {% endfor %}
+                {% if data_fields.len() > 0 %},{% endif %}
+            {% endif %}
+            {% for field in data_fields -%}{% if !loop.first %},{% endif -%}
+                {% if field.elm_type|is_boolean_type %}
+            \soffset builder -> Capnproto.writeBool soffset {{ field.offset / 8 }} {{ field.offset % 8 }} ({% if field|has_bool_default_true %}Basics.not {% endif %}entity.{{ field.name|escape_elm_keyword }}) builder
+                {% else if field.elm_type|is_integer_type || field.elm_type|is_float_type %}
+                    {% if field|has_float_default %}
+            \soffset builder -> Capnproto.write{{ field.elm_type|elm_write_type }}Xor soffset {{ field.offset * field.elm_type|elm_type_bytewidth }} entity.{{ field.name|escape_elm_keyword }} {{ field|default_xor_mask }} builder
+                    {% else if field|has_nonzero_default %}
+            \soffset builder -> Capnproto.write{{ field.elm_type|elm_write_type }} soffset {{ field.offset * field.elm_type|elm_type_bytewidth }} (Bitwise.xor entity.{{ field.name|escape_elm_keyword }} {{ field|default_xor_mask }}) builder
+                    {% else %}
+            \soffset builder -> Capnproto.write{{ field.elm_type|elm_write_type }} soffset {{ field.offset * field.elm_type|elm_type_bytewidth }} entity.{{ field.name|escape_elm_keyword }} builder
+                    {% endif %}
+                {% else if field.elm_type|is_enum_ref %}
+                    {% if field|has_nonzero_default %}
+            \soffset builder -> Capnproto.writeUInt16 soffset {{ field.offset * 2 }} (Bitwise.xor ({{ field.elm_type|elm_type_module_str }}.toCode entity.{{ field.name|escape_elm_keyword }}) {{ field|default_xor_mask }}) builder
+                    {% else %}
+            \soffset builder -> Capnproto.writeUInt16 soffset {{ field.offset * 2 }} ({{ field.elm_type|elm_type_module_str }}.toCode entity.{{ field.name|escape_elm_keyword }}) builder
+                    {% endif %}
+                {% else if field.is_union_container && field.elm_type|strip_union_branches|data_branches_count > 0 %}
+            case entity.{{ field.name|escape_elm_keyword }} of
+                    {% for branch in field.elm_type|strip_union_branches %}
+                        {% if !(branch.elm_type|is_void_type) %}
+                            {% if branch.elm_type|is_boolean_type %}
+                                 {% if field.elm_type|is_union_type %}
+                {{ branch.name|to_upper_camel_case }} value ->
+                                 {% else %}
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                                 {% endif %}
+                    \soffset builder ->
+                        Capnproto.writeBool soffset {{ branch.offset / 8 }} {{ branch.offset % 8 }} ({% if branch|branch_has_bool_default_true %}Basics.not {% endif %}value) builder
+                            {% else if branch.elm_type|is_integer_type || branch.elm_type|is_float_type %}
+                                 {% if field.elm_type|is_union_type %}
+                {{ branch.name|to_upper_camel_case }} value ->
+                                 {% else %}
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                                 {% endif %}
+                                    {% if branch|branch_has_float_default %}
+                    \soffset builder ->
+                        Capnproto.write{{ branch.elm_type|elm_write_type }}Xor soffset {{ branch.offset * branch.elm_type|elm_type_bytewidth }} value {{ branch|branch_default_xor_mask }} builder
+                                    {% else if branch|branch_has_nonzero_default %}
+                    \soffset builder ->
+                        Capnproto.write{{ branch.elm_type|elm_write_type }} soffset {{ branch.offset * branch.elm_type|elm_type_bytewidth }} (Bitwise.xor value {{ branch|branch_default_xor_mask }}) builder
+                                    {% else %}
+                    \soffset builder ->
+                        Capnproto.write{{ branch.elm_type|elm_write_type }} soffset {{ branch.offset * branch.elm_type|elm_type_bytewidth }} value builder
+                                    {% endif %}
+                            {% else if branch.elm_type|is_enum_ref %}
+                                 {% if field.elm_type|is_union_type %}
+                {{ branch.name|to_upper_camel_case }} value ->
+                                 {% else %}
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                                 {% endif %}
+                                    {% if branch|branch_has_nonzero_default %}
+                    \soffset builder ->
+                        Capnproto.writeUInt16 soffset {{ branch.offset * 2 }} (Bitwise.xor ({{ branch.elm_type|elm_type_module_str }}.toCode value) {{ branch|branch_default_xor_mask }}) builder
+                                    {% else %}
+                    \soffset builder ->
+                        Capnproto.writeUInt16 soffset {{ branch.offset * 2 }} ({{ branch.elm_type|elm_type_module_str }}.toCode value) builder
+                                    {% endif %}
+                            {% endif %}
+                        {% endif %}
+                    {% endfor %}
+                    {% if field.elm_type|strip_union_branches|data_branches_count + field.elm_type|strip_union_branches|pointer_branches_count != field.elm_type|strip_union_branches|branches_count || field.elm_type|strip_union_branches|pointer_branches_count > 0 %}
+                _ ->
+                    \_ builder -> builder
+                    {% endif %}
+                {% else -%}
+                {% endif -%}
+            {% endfor -%}
+        ]
+    , pointerEncoders =
+        [
+            {% for field in pointer_fields %}
+                {% if field.elm_type|is_text_type %}
+            Capnproto.encodeTextPointer entity.{{ field.name|escape_elm_keyword }}
+                {% else if field.elm_type|is_data_type %}
+            Capnproto.encodeDataPointer entity.{{ field.name|escape_elm_keyword }}
+                {% else if field.elm_type|is_struct_ref %}
+            \soffset ptrOffset builder ->
+                Capnproto.encodeStructPointer
+                    entity.{{ field.name|escape_elm_keyword }}
+                        {% if field.elm_type|elm_type_module_str == "" %} {# 当前模块 #}
+                            {% if (field.elm_type|strip_type_args).is_empty() %} {# 无泛型 Brand #}
+                    encode
+                            {% else %}
+                    (encode {% for arg in field.elm_type|strip_type_args %}{{ arg|type_to_encoder}} {% endfor %})
+                            {% endif %}
+                    dataWords
+                    pointerWords
+                        {% else %}
+                            {% if (field.elm_type|strip_type_args).is_empty() %} {# 无泛型 Brand #}
+                    {{ field.elm_type|elm_type_module_str }}.encode
+                            {% else %}
+                    ({{ field.elm_type|elm_type_module_str }}.encode {% for arg in field.elm_type|strip_type_args %}{{ arg|type_to_encoder}} {% endfor %})
+                            {% endif %}
+                    {{ field.elm_type|elm_type_module_str }}.dataWords
+                    {{ field.elm_type|elm_type_module_str }}.pointerWords
+                        {% endif %}
+                    soffset
+                    ptrOffset
+                    builder
+                {% else if field.elm_type|is_list_type %}
+            \soffset ptrOffset builder ->
+                Capnproto.encodeListPointer
+                    ({{ field.elm_type|list_encoder_expr }})
+                    entity.{{ field.name|escape_elm_keyword }}
+                    soffset
+                    ptrOffset
+                    builder
+                {% else if field.elm_type|is_interface_ref %}
+            \soffset ptrOffset builder ->
+                Capnproto.encodeNullPointer soffset ptrOffset builder
+                {% else if field.elm_type|is_anypointer_type %}
+            \soffset ptrOffset builder ->
+                Capnproto.encodeAnyPointer entity.{{ field.name|escape_elm_keyword }} soffset ptrOffset builder
+                {% else if field.is_union_container && field.elm_type|strip_union_branches|pointer_branches_count > 0 %}
+            case entity.{{ field.name|escape_elm_keyword }} of
+                    {% for branch in field.elm_type|strip_union_branches %}
+                        {% if branch.elm_type|is_text_type %}
+                            {% if field.elm_type|is_union_type %}
+                {{ branch.name|to_upper_camel_case }} value ->
+                            {% else %}
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                            {% endif %}
+                    Capnproto.encodeTextPointer value
+                        {% else if branch.elm_type|is_data_type %}
+                            {% if field.elm_type|is_union_type %}
+                {{ branch.name|to_upper_camel_case }} value ->
+                            {% else %}
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                            {% endif %}
+                    Capnproto.encodeDataPointer value
+                        {% else if branch.elm_type|is_struct_ref %}
+                            {% if field.elm_type|is_union_type %}
+                {{ branch.name|to_upper_camel_case }} value ->
+                            {% else %}
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                            {% endif %}
+                    \soffset ptrOffset builder ->
+                        Capnproto.encodeStructPointer
+                            value
+                            {% if branch.elm_type|elm_type_module_str == "" %}
+                            encode
+                            dataWords
+                            pointerWords
+                            {% else %}
+                            {{ branch.elm_type|elm_type_module_str }}.encode
+                            {{ branch.elm_type|elm_type_module_str }}.dataWords
+                            {{ branch.elm_type|elm_type_module_str }}.pointerWords
+                            {% endif %}
+                            soffset
+                            ptrOffset
+                            builder
+                        {% else if branch.elm_type|is_list_type %}
+                            {% if field.elm_type|is_union_type %}
+                {{ branch.name|to_upper_camel_case }} value ->
+                            {% else %}
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                            {% endif %}
+                    \soffset ptrOffset builder ->
+                        Capnproto.encodeListPointer
+                            ({{ branch.elm_type|list_encoder_expr }})
+                            value
+                            soffset
+                            ptrOffset
+                            builder
+                        {% else if branch.elm_type|is_anypointer_type %}
+                            {% if field.elm_type|is_union_type %}
+                {{ branch.name|to_upper_camel_case }} value ->
+                            {% else %}
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                            {% endif %}
+                    \soffset ptrOffset builder ->
+                        Capnproto.encodeAnyPointer value soffset ptrOffset builder
+                        {% else if branch.elm_type|is_generic_param_type %}
+                            {% if field.elm_type|is_union_type %}
+                {{ branch.name|to_upper_camel_case }} value ->
+                            {% else %}
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                            {% endif %}
+                    \soffset ptrOffset builder ->
+                        Capnproto.encodeAnyPointer ({{ branch.elm_type|elm_type_str }}Encoder value) soffset ptrOffset builder
+                        {% endif %}
+                    {% endfor %}
+                    {% if field.elm_type|strip_union_branches|pointer_branches_count != (field.elm_type|strip_union_branches).len() %}
+                _ ->
+                    \soffset ptrOffset builder ->
+                        Capnproto.encodeNullPointer soffset ptrOffset builder
+                    {% endif %}
+                {% else if field.elm_type|is_generic_param_type %}
+            \soffset ptrOffset builder ->
+                Capnproto.encodeAnyPointer ({{ field.elm_type|elm_type_str }}Encoder entity.{{ field.name|escape_elm_keyword }}) soffset ptrOffset builder
+                {% endif %}{% if !loop.last %},{% endif %}
+            {% endfor %}
+        ]
+    , dataWords = dataWords
+    , pointerWords = pointerWords
+    }
+
+{% if has_union %}
+getWhich : Capnproto.Reader -> Maybe Int
+getWhich reader =
+    Capnproto.readUInt16 reader {{ module.discriminant_offset * 2 }}
+{% endif %}
+
+{% for field in fields -%}
+    {% if field.elm_type|is_union_type %}{# union 类型 #}
+        {% for branch in field.elm_type|strip_union_branches %}
+is{{ branch.name|to_upper_camel_case }} : Capnproto.Reader -> Bool
+is{{ branch.name|to_upper_camel_case }} reader =
+    case getWhich reader of
+        Just {{ branch.discriminant }} -> True
+        _ -> False
+            {% if !(branch.elm_type|is_void_type) %}
+                {% if branch.elm_type|is_struct_ref %}
+get{{ branch.name|to_upper_camel_case }}Reader : Capnproto.Reader -> Maybe Capnproto.Reader
+get{{ branch.name|to_upper_camel_case }}Reader reader =
+    if is{{ branch.name|to_upper_camel_case }} reader then
+        Capnproto.getStructPointer reader {{ (module.data_words + branch.offset) * 8 }}
+            |> Maybe.map (\( r, _, _ ) -> r)
+    else
+        Nothing
+                {% else if branch.elm_type|is_anypointer_type %}
+get{{ branch.name|to_upper_camel_case }}Reader : Capnproto.Reader -> Maybe Capnproto.Reader
+get{{ branch.name|to_upper_camel_case }}Reader reader =
+    get{{ branch.name|to_upper_camel_case }} reader
+        |> Maybe.andThen
+            (\x ->
+                case x of
+                    Capnproto.AnyPointerDecoded info ->
+                        Just info.target
+
+                    _ ->
+                        Nothing
+            )
+                {% else if branch.elm_type|is_generic_param_type %}
+get{{ branch.name|to_upper_camel_case }}Reader : Capnproto.Reader -> Maybe Capnproto.Reader
+get{{ branch.name|to_upper_camel_case }}Reader reader =
+    if is{{ branch.name|to_upper_camel_case }} reader then
+        case Capnproto.readAnyPointer reader {{ (module.data_words + branch.offset) * 8 }} of
+            Just (Capnproto.AnyPointerDecoded info) ->
+                Just info.target
+            _ ->
+                Nothing
+    else
+        Nothing
+                {% endif %}
+
+                {% if branch.elm_type|is_generic_param_type %}{# 泛型类型分支 #}
+get{{ branch.name|to_upper_camel_case }} : (Capnproto.AnyPointer -> Maybe {{ branch.elm_type|parenthesize_if_needed }}) -> Capnproto.Reader -> Maybe {{ branch.elm_type|parenthesize_if_needed }}
+get{{ branch.name|to_upper_camel_case }} decoder reader =
+                {% else %}{# 其它类型分支 #}
+get{{ branch.name|to_upper_camel_case }} : Capnproto.Reader -> Maybe {{ branch.elm_type|parenthesize_if_needed }}
+get{{ branch.name|to_upper_camel_case }} reader =
+                {% endif %}
+    if is{{ branch.name|to_upper_camel_case }} reader then
+                {% if branch.elm_type|is_boolean_type %}
+        Capnproto.readBool reader {{ branch.offset / 8 }} {{ branch.offset % 8 }}{% if branch|branch_has_bool_default_true %} |> Maybe.map Basics.not{% endif %}
+                {% else if branch.elm_type|is_integer_type || branch.elm_type|is_float_type %}
+                    {% if branch|branch_has_float_default %}
+        Capnproto.read{{ branch.elm_type|elm_read_type }}Xor reader {{ branch.offset * branch.elm_type|elm_type_bytewidth }} {{ branch|branch_default_xor_mask }}
+                    {% else if branch|branch_has_nonzero_default %}
+        Capnproto.read{{ branch.elm_type|elm_read_type }} reader {{ branch.offset * branch.elm_type|elm_type_bytewidth }} |> Maybe.map (Bitwise.xor {{ branch|branch_default_xor_mask }})
+                    {% else %}
+        Capnproto.read{{ branch.elm_type|elm_read_type }} reader {{ branch.offset * branch.elm_type|elm_type_bytewidth }}
+                    {% endif %}
+                {% else if branch.elm_type|is_text_type %}
+        Capnproto.readText reader {{ (module.data_words + branch.offset) * 8 }}
+                {% else if branch.elm_type|is_data_type %}
+        Capnproto.readData reader {{ (module.data_words + branch.offset) * 8 }}
+                {% else if branch.elm_type|is_struct_ref %}
+        Capnproto.getStructPointer reader {{ (module.data_words + branch.offset) * 8 }}
+            |> Maybe.map (\( r, _, _ ) -> r)
+                    {% if branch.elm_type|elm_type_module_str == "" %}{# 当前模块 #}
+            |> Maybe.andThen (decode {% for arg in branch.elm_type|strip_type_args %}{{ arg|type_to_decoder }} {% endfor %}>> Result.toMaybe)
+                    {% else %}{# 非当前模块 #}
+            |> Maybe.andThen ({{ branch.elm_type|elm_type_module_str }}.decode {% for arg in branch.elm_type|strip_type_args %}{{ arg|type_to_decoder }} {% endfor %}>> Result.toMaybe)
+                    {% endif %}
+                {% else if branch.elm_type|is_enum_ref %}
+                    {% if branch|branch_has_nonzero_default %}
+        Capnproto.readUInt16 reader {{ branch.offset * 2 }} |> Maybe.map (Bitwise.xor {{ branch|branch_default_xor_mask }}) |> Maybe.andThen {{ branch.elm_type|elm_type_module_str }}.fromCode
+                    {% else %}
+        Capnproto.readUInt16 reader {{ branch.offset * 2 }} |> Maybe.andThen {{ branch.elm_type|elm_type_module_str }}.fromCode
+                    {% endif %}
+                {% else if branch.elm_type|is_list_type %}
+        get{{ branch.name|to_upper_camel_case}}Count reader
+            |> Maybe.andThen
+                (\count ->
+                    List.range 0 (count - 1)
+                        |> Capnproto.traverseMaybe
+                            (\index -> get{{ branch.name|to_upper_camel_case }}At reader index)
+                )
+                {% else if branch.elm_type|is_anypointer_type %}
+        Capnproto.readAnyPointer reader {{ (module.data_words + branch.offset) * 8 }}
+                {% else if branch.elm_type|is_generic_param_type %}
+        Capnproto.readAnyPointer reader {{ (module.data_words + branch.offset) * 8 }}
+            |> Maybe.andThen decoder
+                {% endif %}
+    else
+        Nothing
+            {% endif %}
+
+            {% if branch.elm_type|is_list_type %}
+get{{ branch.name|to_upper_camel_case }}Count : Capnproto.Reader -> Maybe Int
+get{{ branch.name|to_upper_camel_case }}Count reader =
+    Capnproto.getListPointer reader {{ (module.data_words + branch.offset) * 8 }}
+        |> Maybe.map (\(_, (_, count, _)) -> count)
+
+get{{ branch.name|to_upper_camel_case }}At : Capnproto.Reader -> Int -> Maybe {{ branch.elm_type|strip_list_type|parenthesize_if_needed }}
+get{{ branch.name|to_upper_camel_case }}At reader index =
+    Capnproto.getListElementAt reader {{ (module.data_words + branch.offset) * 8 }} index
+        |> Maybe.andThen ({{ branch.elm_type|list_element_reader_expr }})
+            {% endif %}
+
+        {% endfor %}
+    {% else %}{# 非 union 类型 #}
+        {% if field.elm_type|is_struct_ref %}
+get{{ field.name|to_upper_camel_case }}Reader : Capnproto.Reader -> Maybe Capnproto.Reader
+get{{ field.name|to_upper_camel_case }}Reader reader =
+    Capnproto.getStructPointer reader {{ (module.data_words + field.offset) * 8 }}
+        |> Maybe.map (\( r, _, _ ) -> r)
+        {% endif %}
+
+        {% if field.elm_type|is_anypointer_type %}
+get{{ field.name|to_upper_camel_case }}Reader : Capnproto.Reader -> Maybe Capnproto.Reader
+get{{ field.name|to_upper_camel_case }}Reader reader =
+    get{{ field.name|to_upper_camel_case }} reader
+        |> Maybe.andThen
+            (\x ->
+                case x of
+                    Capnproto.AnyPointerDecoded info ->
+                        Just info.target
+
+                    _ ->
+                        Nothing
+            )
+        {% endif %}
+
+        {% if field.elm_type|is_generic_param_type %}{# 泛型类型字段 #}
+get{{ field.name|to_upper_camel_case }} : (Capnproto.AnyPointer -> Maybe {{ field.elm_type|parenthesize_if_needed }}) -> Capnproto.Reader -> Maybe {{ field.elm_type|parenthesize_if_needed }}
+get{{ field.name|to_upper_camel_case }} decoder reader =
+        {% else if field.elm_type|is_interface_ref %}{# 能力类型字段 #}
+get{{ field.name|to_upper_camel_case }} : Capnproto.Reader -> List Rpc.Capability -> Maybe {{ field.elm_type|parenthesize_if_needed }}
+get{{ field.name|to_upper_camel_case }} reader capTable =
+        {% else %}{# 其它类型字段 #}
+get{{ field.name|to_upper_camel_case }} : Capnproto.Reader -> Maybe {{ field.elm_type|parenthesize_if_needed }}
+get{{ field.name|to_upper_camel_case }} reader =
+        {% endif %}
+        {% if field.elm_type|is_boolean_type -%}
+    Capnproto.readBool reader {{ field.offset / 8 }} {{ field.offset % 8 }}{% if field|has_bool_default_true %} |> Maybe.map Basics.not{% endif %}
+        {% else if field.elm_type|is_integer_type || field.elm_type|is_float_type -%}
+            {% if field|has_float_default -%}
+    Capnproto.read{{ field.elm_type|elm_read_type }}Xor reader {{ field.offset * field.elm_type|elm_type_bytewidth }} {{ field|default_xor_mask }}
+            {% else if field|has_nonzero_default -%}
+    Capnproto.read{{ field.elm_type|elm_read_type }} reader {{ field.offset * field.elm_type|elm_type_bytewidth }} |> Maybe.map (Bitwise.xor {{ field|default_xor_mask }})
+            {% else -%}
+    Capnproto.read{{ field.elm_type|elm_read_type }} reader {{ field.offset * field.elm_type|elm_type_bytewidth }}
+            {% endif -%}
+        {% else if field.elm_type|is_text_type -%}
+    Capnproto.readText reader {{ (module.data_words + field.offset) * 8 }}
+        {% else if field.elm_type|is_data_type -%}
+    Capnproto.readData reader {{ (module.data_words + field.offset) * 8 }}
+        {% else if field.elm_type|is_struct_ref -%}
+    Capnproto.getStructPointer reader {{ (module.data_words + field.offset) * 8 }}
+        |> Maybe.map (\( r, _, _ ) -> r)
+        |> Maybe.andThen ({{ field.elm_type|elm_type_module_str }}.decode {% for arg in field.elm_type|strip_type_args %}{{ arg|type_to_decoder }} {% endfor %}>> Result.toMaybe)
+        {% else if field.elm_type|is_list_type -%}
+    get{{ field.name|to_upper_camel_case}}Count reader
+        |> Maybe.andThen
+            (\count ->
+                List.range 0 (count - 1)
+                    |> Capnproto.traverseMaybe
+                        (\index -> get{{ field.name|to_upper_camel_case }}At reader index)
+            )
+        {% else if field.elm_type|is_enum_ref -%}
+            {% if field|has_nonzero_default -%}
+    Capnproto.readUInt16 reader {{ field.offset * 2 }} |> Maybe.map (Bitwise.xor {{ field|default_xor_mask }}) |> Maybe.andThen {{ field.elm_type|elm_type_module_str }}.fromCode
+            {% else -%}
+    Capnproto.readUInt16 reader {{ field.offset * 2 }}
+        |> Maybe.andThen {{ field.elm_type|elm_type_module_str }}.fromCode
+            {% endif -%}
+        {% else if field.elm_type|is_anypointer_type -%}
+    Capnproto.readAnyPointer reader {{ (module.data_words + field.offset) * 8 }}
+        {% else if field.elm_type|is_interface_ref -%}
+    Capnproto.readCapIndex reader {{ (module.data_words + field.offset) * 8 }}
+        |> Maybe.andThen (\capIndex -> List.drop capIndex capTable |> List.head)
+        {% endif %}
+
+        {% if field.elm_type|is_list_type %}
+get{{ field.name|to_upper_camel_case }}Count : Capnproto.Reader -> Maybe Int
+get{{ field.name|to_upper_camel_case }}Count reader =
+    Capnproto.getListPointer reader {{ (module.data_words + field.offset) * 8 }}
+        |> Maybe.map (\(_, (_, count, _)) -> count)
+
+get{{ field.name|to_upper_camel_case }}At : Capnproto.Reader -> Int -> Maybe {{ field.elm_type|strip_list_type|parenthesize_if_needed }}
+get{{ field.name|to_upper_camel_case }}At reader index =
+    Capnproto.getListElementAt reader {{ (module.data_words + field.offset) * 8 }} index
+        |> Maybe.andThen ({{ field.elm_type|list_element_reader_expr }})
+        {% endif %}
+    {% endif %}
+{% endfor %}
+
+
+{% if !generic_params.is_empty() || has_interface_fields %}
+decode : {% for param in generic_params %}(Capnproto.AnyPointer -> Maybe {{ param }}) -> {% endfor %}{% if has_interface_fields %}List Rpc.Capability -> {% endif %}Capnproto.Reader -> Result String (Entity {% for param in generic_params %}{{ param }} {% endfor %})
+decode {% if generic_params.len() > 0 %}{% for param in generic_params %}{{ param }}Decoder {% endfor %}{% endif %}{% if has_interface_fields %}capTable {% endif %}reader =
+{% else %}
+decode : Capnproto.Reader -> Result String Entity
+decode reader =
+{% endif %}
+{% if fields.is_empty() %}
+    Ok Entity
+{% else %}
+    let
+{% for field in fields %}
+    {% if field.elm_type|is_enum_ref %}
+        maybe{{ field.name|to_upper_camel_case }} =
+            get{{ field.name|to_upper_camel_case }} reader
+    {% else if field.is_union_container %}
+        maybe{{ field.name|to_upper_camel_case }} =
+            case getWhich reader of
+        {% for branch in field.elm_type|strip_union_branches %}
+                Just {{ branch.discriminant }} ->
+            {% if branch.elm_type|is_void_type %}
+                {% if field.elm_type|is_union_type %}
+                    Just {{ branch.name|to_upper_camel_case }}
+                {% else %}
+                    Just {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }}
+                {% endif %}
+            {% else if branch.elm_type|is_generic_param_type %}
+                    get{{ branch.name|to_upper_camel_case }} {{ branch.elm_type|elm_type_str}}Decoder reader
+                {% if field.elm_type|is_union_type %}
+                        |> Maybe.map {{ branch.name|to_upper_camel_case }}
+                {% else %}
+                        |> Maybe.map {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }}
+                {% endif %}
+            {% else %}
+                    get{{ branch.name|to_upper_camel_case }} reader
+                {% if field.elm_type|is_union_type %}
+                        |> Maybe.map {{ branch.name|to_upper_camel_case }}
+                {% else %}
+                        |> Maybe.map {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }}
+                {% endif %}
+            {% endif %}
+        {% endfor %}
+                _ -> Nothing
+    {% else if field.elm_type|is_interface_ref %}
+        maybe{{ field.name|to_upper_camel_case }} =
+            get{{ field.name|to_upper_camel_case }} reader capTable
+    {% else %}
+        maybe{{ field.name|to_upper_camel_case }} =
+            get{{ field.name|to_upper_camel_case }} reader
+    {% endif %}
+{% endfor %}
+    in
+    Ok Entity
+{% for field in fields -%}
+    |> Capnproto.andMap (Capnproto.requireField "{{ field.name }}" maybe{{ field.name|to_upper_camel_case }})
+{% endfor %}
+{% endif %}
+
+{% if !generic_params.is_empty() %}{# 有泛型参数 #}
+toAnyPointer : {% for param in generic_params %}({{ param }} -> Capnproto.AnyPointer) -> {% endfor %}Entity {% for param in generic_params %}{{ param }} {% endfor %}-> Capnproto.AnyPointer
+toAnyPointer {% for param in generic_params %}{{ param }}Encoder {% endfor %}value =
+    Capnproto.AnyPointerEncoder
+        (\builder ->
+            let
+                ( newBuilder, offset ) =
+                    Capnproto.encodeStructLayout (encode {% for param in generic_params %}{{ param }}Encoder {% endfor %}value) builder
+            in
+            ( newBuilder, offset, Capnproto.PointerWriteInfoStructInfo dataWords pointerWords )
+        )
+
+
+fromAnyPointer : {% for param in generic_params %}(Capnproto.AnyPointer -> Maybe {{ param }}) -> {% endfor %}Capnproto.AnyPointer -> Maybe (Entity {% for param in generic_params %}{{ param }} {% endfor %})
+fromAnyPointer {% for param in generic_params %}{{ param }}Decoder {% endfor %}pointer =
+    case pointer of
+        Capnproto.AnyPointerDecoded info ->
+            decode {% for param in generic_params %}{{ param }}Decoder {% endfor %}{% if has_interface_fields %}[] {% endif %}info.target
+                |> Result.toMaybe
+
+        _ ->
+            Nothing
+{% else %}{# 没有泛型参数 #}
+toAnyPointer : Entity -> Capnproto.AnyPointer
+toAnyPointer entity =
+    Capnproto.AnyPointerEncoder
+        (\builder ->
+            let
+                ( newBuilder, offset ) =
+                    Capnproto.encodeStructLayout (encode entity) builder
+            in
+            ( newBuilder, offset, Capnproto.PointerWriteInfoStructInfo dataWords pointerWords )
+        )
+
+
+fromAnyPointer : Capnproto.AnyPointer -> Maybe Entity
+fromAnyPointer pointer =
+    case pointer of
+        Capnproto.AnyPointerDecoded info ->
+            decode {% if has_interface_fields %}[] {% endif %}info.target
+                |> Result.toMaybe
+
+        _ ->
+            Nothing
+{% endif %}

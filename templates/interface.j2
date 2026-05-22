@@ -1,0 +1,35 @@
+interfaceId : Capnproto.Word64
+interfaceId =
+    Capnproto.toWord64 {{ interface_high }} {{ interface_low }}
+
+{% for method in methods %}
+{{ method.name }} : Rpc.Capability
+    -> Rpc.RpcState msg
+    {% for param in method.implicit_parameters %}-> {{ param }}
+    {% endfor %}-> {{ method.param_type|elm_type_str }}
+    -> (Result Rpc.RpcError {{ method.result_type|elm_type_str }} -> msg)
+    -> ( Rpc.RpcState msg, Cmd msg )
+{{ method.name }} target state
+    {% for param in method.implicit_parameters %}{{ param }} {% endfor %}params toMsg =
+    let
+        paramsLayout =
+            {{ method.param_type|elm_type_module_str }}.encode params
+
+        decoder : Rpc.ReturnInfo -> msg
+        decoder returnInfo =
+            toMsg
+                (case returnInfo.content of
+                    Ok reader ->
+                        {% if method.result_has_caps %}
+                        {{ method.result_type|elm_type_module_str }}.decode returnInfo.capTable reader
+                        {% else %}
+                        {{ method.result_type|elm_type_module_str }}.decode reader
+                        {% endif %}
+                            |> Result.mapError Rpc.DecodingError
+
+                    Err err ->
+                        Err err
+                )
+    in
+    Rpc.call target interfaceId {{ method.id }} paramsLayout decoder state
+{% endfor %}

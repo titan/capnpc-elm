@@ -1,0 +1,920 @@
+port module Rpc.Client exposing
+    ( Capability(..)
+    , RpcError(..)
+    , ReturnInfo
+    , RpcState
+    , bootstrap
+    , call
+    , encodeRpcMessage
+    , handleMessage
+    , initState
+    , releaseCapability
+    , sendAbort
+    , sendFinish
+    , sendRelease
+    , subscriptions
+    )
+
+import Bitwise
+import Bytes exposing (Bytes)
+import Bytes.Decode as BD
+import Bytes.Encode as BE
+import Rpc.Call
+import Rpc.Message
+import Rpc.MessageTarget
+import Rpc.Payload
+import Rpc.Return
+import Rpc.Finish
+import Rpc.Release
+import Rpc.Bootstrap
+import Rpc.Exception
+import Rpc.Exception.Type
+import Rpc.Resolve
+import Rpc.Disembargo
+import Rpc.PromisedAnswer.Op
+import Rpc.CapDescriptor
+import Capnproto
+import Dict exposing (Dict)
+import Json.Decode as JD
+import Json.Encode as JE
+
+
+{-| RPC error types
+-}
+type RpcError
+    = DecodingError String
+    | TransportError String
+    | CapnpError String
+    | TimeoutError String
+
+
+{- ==============================================================================
+   Capability Type
+
+   Represents a reference to a remote (or local) capability.
+   Level 1: tracks promise state for pipelining.
+   ==============================================================================
+-}
+
+type Capability
+    = ImportCap Int
+    | ExportCap Int
+    | PipelineCap Int (List Rpc.PromisedAnswer.Op.Entity)
+    | NullCap
+    | BrokenCap String
+
+
+{- ==============================================================================
+   ReturnInfo — Level 1 return payload
+
+   Contains both the decoded content reader and the capTable capabilities
+   extracted from the Return message's Payload.
+   ==============================================================================
+-}
+
+type alias ReturnInfo =
+    { content : Result RpcError Capnproto.Reader
+    , capTable : List Capability
+    }
+
+
+{- ==============================================================================
+   RPC State — Four-Table State Machine (Level 1)
+
+   Question table: outgoing calls awaiting Return
+   Answer table: incoming calls being processed (server-side, deferred)
+   Import table: capabilities received from the remote vat (with promise tracking)
+   Export table: capabilities we've sent to the remote vat
+   ==============================================================================
+-}
+
+type alias QuestionEntry msg =
+    { callback : ReturnInfo -> msg
+    }
+
+
+type alias AnswerEntry =
+    {}
+
+
+type alias ImportEntry =
+    { refCount : Int
+    , isPromise : Bool
+    }
+
+
+type alias ExportEntry =
+    { refCount : Int
+    }
+
+
+type alias RpcState msg =
+    { nextQuestionId : Int
+    , nextExportId : Int
+    , nextImportId : Int
+    , questions : Dict Int (QuestionEntry msg)
+    , answers : Dict Int AnswerEntry
+    , importTable : Dict Int ImportEntry
+    , exportTable : Dict Int ExportEntry
+    }
+
+
+{- ==============================================================================
+   Initialization
+   ==============================================================================
+-}
+
+initState : RpcState msg
+initState =
+    { nextQuestionId = 1
+    , nextExportId = 0
+    , nextImportId = 0
+    , questions = Dict.empty
+    , answers = Dict.empty
+    , importTable = Dict.empty
+    , exportTable = Dict.empty
+    }
+
+
+{- ==============================================================================
+   Ports
+   ==============================================================================
+-}
+
+port sendRpcRequest : JE.Value -> Cmd msg
+
+port recvRpcResponse : (JD.Value -> msg) -> Sub msg
+
+
+sendBytes : Int -> Bytes -> Cmd msg
+sendBytes id data =
+    sendRpcRequest (encodeRequest { id = id, data = data })
+
+
+sendAllBytes : Int -> List Bytes -> Cmd msg
+sendAllBytes id byteList =
+    case byteList of
+        [ single ] ->
+            sendBytes id single
+
+        _ ->
+            let
+                combined =
+                    BE.encode (BE.sequence (List.map BE.bytes byteList))
+            in
+            sendBytes id combined
+
+
+subscriptions : (Bytes -> msg) -> Sub msg
+subscriptions toMsg =
+    recvRpcResponse (decodeResponse toMsg)
+
+
+{- ==============================================================================
+   Request/Response framing
+   ==============================================================================
+-}
+
+encodeRequest : { id : Int, data : Bytes } -> JE.Value
+encodeRequest request =
+    JE.object
+        [ ( "id", JE.int request.id )
+        , ( "data", JE.list JE.int (bytesToList request.data) )
+        ]
+
+
+decodeResponse : (Bytes -> msg) -> JD.Value -> msg
+decodeResponse toMsg value =
+    case JD.decodeValue (JD.field "data" (JD.list JD.int)) value of
+        Ok intList ->
+            case listToBytes intList of
+                Ok bytes ->
+                    toMsg bytes
+
+                Err _ ->
+                    toMsg (BE.encode (BE.sequence []))
+
+        Err _ ->
+            toMsg (BE.encode (BE.sequence []))
+
+
+bytesToList : Bytes -> List Int
+bytesToList bytes =
+    let
+        width =
+            Bytes.width bytes
+
+        decoder =
+            BD.loop ( 0, [] ) (decodeAllBytes width)
+    in
+    case BD.decode decoder bytes of
+        Just byteList ->
+            byteList
+
+        Nothing ->
+            []
+
+
+decodeAllBytes :
+    Int
+    -> ( Int, List Int )
+    -> BD.Decoder (BD.Step ( Int, List Int ) (List Int))
+decodeAllBytes totalWidth ( offset, acc ) =
+    if offset >= totalWidth then
+        BD.succeed (BD.Done (List.reverse acc))
+
+    else
+        BD.map (\byte -> BD.Loop ( offset + 1, byte :: acc )) BD.unsignedInt8
+
+
+listToBytes : List Int -> Result String Bytes
+listToBytes intList =
+    if List.isEmpty intList then
+        Ok (BE.encode (BE.sequence []))
+
+    else
+        let
+            encoders =
+                List.map BE.unsignedInt8 intList
+        in
+        Ok (BE.encode (BE.sequence encoders))
+
+
+{- ==============================================================================
+    Message Encoding
+    ==============================================================================
+    -}
+
+encodeRpcMessage : Rpc.Message.Entity -> Bytes
+encodeRpcMessage message =
+    let
+        builder =
+            Capnproto.createBuilder
+
+        ( builder0, rootPointerOffset ) =
+            Capnproto.allocateBytes Capnproto.wordSize builder
+
+        layout =
+            Rpc.Message.encode message
+
+        ( builder1, messageOffset ) =
+            Capnproto.encodeStructLayout layout builder0
+
+        offsetWords =
+            (messageOffset.offset - rootPointerOffset.offset - Capnproto.wordSize) // Capnproto.wordSize
+
+        finalBuilder =
+            builder1
+                |> Capnproto.writeUInt32 rootPointerOffset 0 (Bitwise.shiftLeftBy 2 offsetWords)
+                |> Capnproto.writeUInt32 rootPointerOffset 4 (Bitwise.or (Bitwise.shiftLeftBy 16 layout.pointerWords) layout.dataWords)
+    in
+    Capnproto.finalize finalBuilder
+
+
+{- ==============================================================================
+   Bootstrap (Level 1)
+
+   1. Client allocates questionId, sends Bootstrap { questionId }
+   2. Server returns Return with Payload capTable containing capabilities
+   3. Client extracts capabilities from capTable
+
+   The callback receives a list of all capabilities from the Return's capTable.
+   For Level 0 servers (empty capTable), falls back to ImportCap 0.
+   ==============================================================================
+-}
+
+bootstrap :
+    (Result RpcError (List Capability) -> msg)
+    -> RpcState msg
+    -> ( RpcState msg, Cmd msg )
+bootstrap toMsg state =
+    let
+        questionId =
+            state.nextQuestionId
+
+        callback : ReturnInfo -> msg
+        callback returnInfo =
+            let
+                capResult =
+                    if List.isEmpty returnInfo.capTable then
+                        -- Level 0 fallback: assume ImportCap 0
+                        Ok [ ImportCap 0 ]
+                    else
+                        Ok returnInfo.capTable
+            in
+            toMsg capResult
+
+        newState =
+            { state
+                | nextQuestionId = questionId + 1
+                , questions =
+                    Dict.insert questionId
+                        { callback = callback }
+                        state.questions
+            }
+
+        bootstrapMsg =
+            { unnamedUnion = Rpc.Message.Bootstrap { questionId = questionId, deprecatedObjectId = Capnproto.AnyPointerEncoder (\builder -> ( builder, Capnproto.nullPointerOffset, Capnproto.PointerWriteInfoGenericPointer )) } }
+
+        messageBytes =
+            encodeRpcMessage bootstrapMsg
+    in
+    ( newState, sendBytes questionId messageBytes )
+
+
+{- ==============================================================================
+   RPC Call (Level 1)
+
+   Makes a call on a specific Capability target.
+   The callback receives ReturnInfo with both content reader and capTable.
+
+   Message flow:
+     Client -> Server: Call { questionId, target, interfaceId, methodId, params }
+     Server -> Client: Return { answerId, results }
+     Client -> Server: Finish { questionId, releaseResultCaps }
+-}
+
+call :
+    Capability
+    -> Capnproto.Word64
+    -> Int
+    -> Capnproto.StructLayout
+    -> (ReturnInfo -> msg)
+    -> RpcState msg
+    -> ( RpcState msg, Cmd msg )
+call target interfaceId methodId paramsLayout toMsg state =
+    let
+        questionId =
+            state.nextQuestionId
+
+        newState =
+            { state
+                | nextQuestionId = questionId + 1
+                , questions =
+                    Dict.insert questionId
+                        { callback = toMsg }
+                        state.questions
+            }
+
+        messageTarget =
+            capabilityToMessageTarget target
+
+        paramsEncoder builder =
+            let
+                ( newBuilder, offset ) =
+                    Capnproto.encodeStructLayout paramsLayout builder
+            in
+            ( newBuilder, offset, Capnproto.PointerWriteInfoStructInfo paramsLayout.dataWords paramsLayout.pointerWords )
+
+        payload =
+            { content = Capnproto.AnyPointerEncoder paramsEncoder
+            , capTable = []
+            }
+
+        callMsg =
+            { questionId = questionId
+            , target = messageTarget
+            , interfaceId = interfaceId
+            , methodId = methodId
+            , params = payload
+            , sendResultsTo = Rpc.Call.Caller
+            , allowThirdPartyTailCall = False
+            , noPromisePipelining = False
+            , onlyPromisePipeline = False
+            }
+
+        message =
+            { unnamedUnion = Rpc.Message.Call callMsg }
+
+        messageBytes =
+            encodeRpcMessage message
+    in
+    ( newState, sendBytes questionId messageBytes )
+
+
+{-| Convert a Capability to a MessageTarget for RPC Call messages.
+-}
+capabilityToMessageTarget : Capability -> { unnamedUnion : Rpc.MessageTarget.Union }
+capabilityToMessageTarget cap =
+    case cap of
+        ImportCap importId ->
+            { unnamedUnion = Rpc.MessageTarget.ImportedCap importId }
+
+        PipelineCap questionId transform ->
+            { unnamedUnion = Rpc.MessageTarget.PromisedAnswer { questionId = questionId, transform = transform } }
+
+        ExportCap exportId ->
+            { unnamedUnion = Rpc.MessageTarget.PromisedAnswer { questionId = exportId, transform = [] } }
+
+        NullCap ->
+            { unnamedUnion = Rpc.MessageTarget.ImportedCap 0 }
+
+        BrokenCap _ ->
+            { unnamedUnion = Rpc.MessageTarget.ImportedCap 0 }
+
+
+{- ==============================================================================
+   Finish Message
+
+   Encoded by client after receiving Return to release server resources.
+   The caller is responsible for sending the returned Bytes via the transport.
+   ==============================================================================
+-}
+
+sendFinish : Int -> Bool -> Cmd msg
+sendFinish questionId releaseResultCaps =
+    let
+        finish =
+            { questionId = questionId
+            , releaseResultCaps = releaseResultCaps
+            , requireEarlyCancellationWorkaround = False
+            }
+
+        message =
+            { unnamedUnion = Rpc.Message.Finish finish }
+
+        messageBytes =
+            encodeRpcMessage message
+    in
+    sendBytes questionId messageBytes
+
+
+{- ==============================================================================
+   Release Message
+
+   Encoded when an imported capability's reference count reaches zero.
+   The caller is responsible for sending the returned Bytes via the transport.
+   ==============================================================================
+-}
+
+sendRelease : Int -> Int -> Cmd msg
+sendRelease importId referenceCount =
+    let
+        release =
+            { id = importId
+            , referenceCount = referenceCount
+            }
+
+        message =
+            { unnamedUnion = Rpc.Message.Release release }
+
+        messageBytes =
+            encodeRpcMessage message
+    in
+    sendBytes 0 messageBytes
+
+
+{-| Abort Message (Level 1)
+
+    Encoded when the connection is being aborted due to an unrecoverable error.
+    The caller is responsible for sending the returned Bytes via the transport.
+-}
+sendAbort : String -> Cmd msg
+sendAbort reason =
+    let
+        exception =
+            { reason = reason
+            , type_ = Rpc.Exception.Type.Failed
+            , obsoleteIsCallersFault = False
+            , obsoleteDurability = 0
+            , trace = ""
+            }
+
+        message =
+            { unnamedUnion = Rpc.Message.Abort exception }
+
+        messageBytes =
+            encodeRpcMessage message
+    in
+    sendBytes 0 messageBytes
+
+
+{-| Release a capability reference.
+
+    Decrements the import's reference count.
+    If count reaches zero, returns Just bytes (Release message to send).
+    The caller is responsible for sending the returned Bytes via the transport.
+-}
+releaseCapability : RpcState msg -> Capability -> ( RpcState msg, Cmd msg )
+releaseCapability state cap =
+    case cap of
+        ImportCap importId ->
+            let
+                ( newRefCount, releaseCmd ) =
+                    case Dict.get importId state.importTable of
+                        Just entry ->
+                            let
+                                updatedCount =
+                                    entry.refCount - 1
+                            in
+                            if updatedCount <= 0 then
+                                ( 0, sendRelease importId entry.refCount )
+                            else
+                                ( updatedCount, Cmd.none )
+
+                        Nothing ->
+                            ( 0, Cmd.none )
+
+                newImportTable =
+                    if newRefCount <= 0 then
+                        Dict.remove importId state.importTable
+                    else
+                        Dict.insert importId { refCount = newRefCount, isPromise = False } state.importTable
+            in
+            ( { state | importTable = newImportTable }, releaseCmd )
+
+        _ ->
+            ( state, Cmd.none )
+
+
+{-| Handle an incoming raw RPC message (Level 1).
+
+    Dispatches incoming RPC messages to the appropriate handler.
+    Returns: ( updated state, outgoing messages to send, optional application message )
+    The caller is responsible for sending the outgoing Bytes via the transport.
+-}
+handleMessage : RpcState msg -> Bytes -> ( RpcState msg, Cmd msg, Maybe msg )
+handleMessage state messageBytes =
+    let
+        reader =
+            Capnproto.createReader messageBytes
+    in
+    if Rpc.Message.isReturn reader then
+        handleReturn state reader
+
+    else if Rpc.Message.isResolve reader then
+        handleResolve state reader
+
+    else if Rpc.Message.isDisembargo reader then
+        handleDisembargo state reader
+
+    else if Rpc.Message.isRelease reader then
+        handleReleaseMessage state reader
+
+    else if Rpc.Message.isAbort reader then
+        handleAbort state reader
+
+    else if Rpc.Message.isUnimplemented reader then
+        ( state, Cmd.none, Nothing )
+
+    else
+        ( state, Cmd.none, Nothing )
+
+
+{-| Handle a Return message (Level 1).
+
+    Looks up the question in the question table,
+    processes the capTable from the Payload,
+    extracts the result payload,
+    invokes the callback,
+    returns Finish bytes for the caller to send.
+-}
+handleReturn : RpcState msg -> Capnproto.Reader -> ( RpcState msg, Cmd msg, Maybe msg )
+handleReturn state reader =
+    let
+        maybeAnswerId =
+            reader
+                |> Rpc.Message.getReturnReader
+                |> Maybe.andThen
+                    (\returnReader ->
+                        Rpc.Return.getAnswerId returnReader
+                            |> Maybe.map (\aid -> ( aid, returnReader ))
+                    )
+    in
+    case maybeAnswerId of
+        Just ( answerId, returnReader ) ->
+            case Dict.get answerId state.questions of
+                Just questionEntry ->
+                    let
+                        -- Extract payload content from Return
+                        contentResult =
+                            returnReader
+                                |> Rpc.Return.getResultsReader
+                                |> Maybe.andThen Rpc.Payload.getContentReader
+                                |> Result.fromMaybe (DecodingError "Failed to extract Return payload")
+
+                        -- Process capTable from Return (Level 1)
+                        ( stateWithCaps, capCmds, capTable ) =
+                            processReturnCapTable state returnReader
+
+                        -- Remove question from table
+                        newState =
+                            { stateWithCaps | questions = Dict.remove answerId stateWithCaps.questions }
+
+                        -- Encode Finish to release server resources
+                        finishCmd =
+                            sendFinish answerId True
+
+                        -- Build ReturnInfo
+                        returnInfo =
+                            { content = contentResult
+                            , capTable = capTable
+                            }
+
+                        -- Invoke application callback
+                        appMsg =
+                            Just (questionEntry.callback returnInfo)
+                    in
+                    ( newState, Cmd.batch [ finishCmd, capCmds ], appMsg )
+
+                Nothing ->
+                    ( state, Cmd.none, Nothing )
+
+        Nothing ->
+            ( state, Cmd.none, Nothing )
+
+
+{-| Process the capTable from a Return message's Payload.
+
+   Reads each CapDescriptor, creates appropriate Capability values,
+   and updates the import table with new entries.
+
+   For each CapDescriptor:
+   - SenderHosted(N): peer exports cap as export #N → create ImportCap(N)
+     The import ID MUST match the sender's export ID, because when we later
+     send ImportedCap(N) in a MessageTarget, the peer maps it to export #N.
+   - SenderPromise(N): peer's promise export #N → ImportCap(N) marked as promise
+   - ReceiverHosted(N): refers to our own export #N → ExportCap(N)
+   - ReceiverAnswer: refers to a cap from a previous question's result → PipelineCap(questionId, transform)
+     The transform navigates into the result struct (e.g., GetPointerField for field access).
+     When used as a Call target, produces a PromisedAnswer message for promise pipelining.
+-}
+processReturnCapTable : RpcState msg -> Capnproto.Reader -> ( RpcState msg, Cmd msg, List Capability )
+processReturnCapTable state returnReader =
+    let
+        maybePayloadReader =
+            Rpc.Return.getResultsReader returnReader
+    in
+    case maybePayloadReader of
+        Just payloadReader ->
+            let
+                maybeCapCount =
+                    Rpc.Payload.getCapTableCount payloadReader
+            in
+            case maybeCapCount of
+                Just count ->
+                    if count == 0 then
+                        ( state, Cmd.none, [] )
+                    else
+                        let
+                            ( finalState, finalCmds, caps ) =
+                                List.foldl
+                                    (\index ( st, cmds, capList ) ->
+                                        case Rpc.Payload.getCapTableAt payloadReader index of
+                                            Just capDesc ->
+                                                let
+                                                    ( newState, newCmds, cap ) =
+                                                        processCapDescriptor st capDesc
+                                                in
+                                                ( newState, Cmd.batch [ cmds, newCmds ], cap :: capList )
+
+                                            Nothing ->
+                                                ( st, cmds, capList )
+                                    )
+                                    ( state, Cmd.none, [] )
+                                    (List.range 0 (count - 1))
+                        in
+                        ( finalState, finalCmds, List.reverse caps )
+
+                Nothing ->
+                    ( state, Cmd.none, [] )
+
+        Nothing ->
+            ( state, Cmd.none, [] )
+
+
+{-| Process a single CapDescriptor from a Return's capTable.
+
+   IMPORTANT: For SenderHosted/SenderPromise, the import ID must be the
+   sender's export ID (the Int value in the union variant). This ID is
+   shared between both vats — when we send ImportedCap(id), the peer
+   maps it to its own export table entry at that index.
+-}
+processCapDescriptor : RpcState msg -> Rpc.CapDescriptor.Entity -> ( RpcState msg, Cmd msg, Capability )
+processCapDescriptor state capDesc =
+    case capDesc.unnamedUnion of
+        Rpc.CapDescriptor.SenderHosted senderExportId ->
+            -- Peer hosts this cap as export #senderExportId
+            -- We import it with the SAME ID so ImportedCap references work
+            let
+                importId =
+                    senderExportId
+
+                newState =
+                    { state
+                        | importTable =
+                            Dict.insert importId
+                                { refCount = 1
+                                , isPromise = False
+                                }
+                                state.importTable
+                    }
+            in
+            ( newState, Cmd.none, ImportCap importId )
+
+        Rpc.CapDescriptor.SenderPromise senderExportId ->
+            -- Peer's promise export #senderExportId → import with same ID, await Resolve
+            let
+                importId =
+                    senderExportId
+
+                newState =
+                    { state
+                        | importTable =
+                            Dict.insert importId
+                                { refCount = 1
+                                , isPromise = True
+                                }
+                                state.importTable
+                    }
+            in
+            ( newState, Cmd.none, ImportCap importId )
+
+        Rpc.CapDescriptor.ReceiverHosted exportId ->
+            -- Refers to a capability we previously exported
+            ( state, Cmd.none, ExportCap exportId )
+
+        Rpc.CapDescriptor.ReceiverAnswer promisedAnswer ->
+            -- Refers to a cap from a previous question's result
+            ( state, Cmd.none, PipelineCap promisedAnswer.questionId promisedAnswer.transform )
+
+        _ ->
+            ( state, Cmd.none, NullCap )
+
+
+{-| Handle a Resolve message (Level 1).
+
+    When the peer resolves a promise:
+    - If Cap: process the replacement CapDescriptor, update import table
+    - If Exception: remove the promise entry (broken capability)
+-}
+handleResolve : RpcState msg -> Capnproto.Reader -> ( RpcState msg, Cmd msg, Maybe msg )
+handleResolve state reader =
+    let
+        maybeResolveReader =
+            Rpc.Message.getResolveReader reader
+
+        maybePromiseId =
+            maybeResolveReader
+                |> Maybe.andThen Rpc.Resolve.getPromiseId
+    in
+    case ( maybeResolveReader, maybePromiseId ) of
+        ( Just resolveReader, Just promiseId ) ->
+            if Rpc.Resolve.isCap resolveReader then
+                -- Resolve with a CapDescriptor
+                case Rpc.Resolve.getCap resolveReader of
+                    Just capDesc ->
+                        let
+                            ( newState, newCmds, _ ) =
+                                processCapDescriptor state capDesc
+
+                            -- Update import table: mark promise as resolved
+                            newImportTable =
+                                case Dict.get promiseId newState.importTable of
+                                    Just entry ->
+                                        Dict.insert promiseId { entry | isPromise = False } newState.importTable
+
+                                    Nothing ->
+                                        newState.importTable
+                        in
+                        ( { newState | importTable = newImportTable }, newCmds, Nothing )
+
+                    Nothing ->
+                        ( state, Cmd.none, Nothing )
+
+            else
+                -- Resolve with exception — remove the broken promise
+                let
+                    newImportTable =
+                        Dict.remove promiseId state.importTable
+                in
+                ( { state | importTable = newImportTable }, Cmd.none, Nothing )
+
+        _ ->
+            ( state, Cmd.none, Nothing )
+
+
+{-| Handle a Disembargo message (Level 1).
+
+    Echo-back implementation: when context is SenderLoopback,
+    respond with Disembargo where context is ReceiverLoopback.
+    This satisfies the E-order requirement for Level 1.
+-}
+handleDisembargo : RpcState msg -> Capnproto.Reader -> ( RpcState msg, Cmd msg, Maybe msg )
+handleDisembargo state reader =
+    let
+        maybeDisembargoReader =
+            Rpc.Message.getDisembargoReader reader
+    in
+    case maybeDisembargoReader of
+        Just disembargoReader ->
+            let
+                maybeTarget =
+                    Rpc.Disembargo.getTarget disembargoReader
+            in
+            if Rpc.Disembargo.isSenderLoopback disembargoReader then
+                -- SenderLoopback: echo back as ReceiverLoopback
+                case Rpc.Disembargo.getSenderLoopback disembargoReader of
+                    Just loopbackId ->
+                        let
+                            target =
+                                maybeTarget
+                                    |> Maybe.withDefault { unnamedUnion = Rpc.MessageTarget.ImportedCap 0 }
+
+                            response =
+                                { target = target
+                                , context = Rpc.Disembargo.ReceiverLoopback loopbackId
+                                }
+
+                            message =
+                                { unnamedUnion = Rpc.Message.Disembargo response }
+
+                            messageBytes =
+                                encodeRpcMessage message
+                        in
+                        ( state, sendBytes 0 messageBytes, Nothing )
+
+                    Nothing ->
+                        ( state, Cmd.none, Nothing )
+
+            else
+                -- Other contexts: ignore for Level 1 MVP
+                ( state, Cmd.none, Nothing )
+
+        Nothing ->
+            ( state, Cmd.none, Nothing )
+
+
+{-| Handle a Release message.
+
+    Removes the export from the export table if reference count drops to zero.
+-}
+handleReleaseMessage : RpcState msg -> Capnproto.Reader -> ( RpcState msg, Cmd msg, Maybe msg )
+handleReleaseMessage state reader =
+    let
+        maybeReleaseInfo =
+            reader
+                |> Rpc.Message.getReleaseReader
+                |> Maybe.andThen
+                    (\releaseReader ->
+                        let
+                            id =
+                                releaseReader
+                                    |> Rpc.Release.getId
+                                    |> Maybe.withDefault 0
+
+                            referenceCount =
+                                releaseReader
+                                    |> Rpc.Release.getReferenceCount
+                                    |> Maybe.withDefault 0
+                        in
+                        Just ( id, referenceCount )
+                    )
+    in
+    case maybeReleaseInfo of
+        Just ( exportId, referenceCount ) ->
+            let
+                newExportTable =
+                    case Dict.get exportId state.exportTable of
+                        Just entry ->
+                            let
+                                newCount =
+                                    entry.refCount - referenceCount
+                            in
+                            if newCount <= 0 then
+                                Dict.remove exportId state.exportTable
+                            else
+                                Dict.insert exportId { refCount = newCount } state.exportTable
+
+                        Nothing ->
+                            state.exportTable
+            in
+            ( { state | exportTable = newExportTable }, Cmd.none, Nothing )
+
+        Nothing ->
+            ( state, Cmd.none, Nothing )
+
+
+{-| Handle an Abort message.
+
+    The remote vat has aborted the connection due to an unrecoverable error.
+    Clear all pending questions and tables.
+-}
+handleAbort : RpcState msg -> Capnproto.Reader -> ( RpcState msg, Cmd msg, Maybe msg )
+handleAbort state reader =
+    let
+        _ =
+            reader
+                |> Rpc.Message.getAbortReader
+                |> Maybe.andThen Rpc.Exception.getReason
+                |> Maybe.withDefault "Unknown abort reason"
+    in
+    ( { state
+        | questions = Dict.empty
+        , answers = Dict.empty
+        , importTable = Dict.empty
+        , exportTable = Dict.empty
+      }
+    , Cmd.none
+    , Nothing
+    )

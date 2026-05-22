@@ -2,11 +2,10 @@ use crate::elm::{
     ElmContext, ElmDefaultValue, ElmEnumVariant, ElmField, ElmInterface, ElmMethod, ElmModule,
     ElmPrimitiveType, ElmType, ElmTypeDef, ElmUnionBranch,
 };
+use crate::output::{FileWriter, OutputWriter};
 use askama::Template;
 use heck::ToUpperCamelCase;
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Template)]
 #[template(path = "module.j2", escape = "none")]
@@ -58,77 +57,64 @@ struct RpcTemplate;
 #[template(path = "websocket.j2", escape = "none")]
 struct WebSocketTemplate;
 
-// 渲染所有模块
-pub fn render_elm_modules(context: &ElmContext) -> anyhow::Result<()> {
+// 渲染所有模块到自定义 OutputWriter
+pub fn render_elm_modules_to(
+    context: &ElmContext,
+    writer: &dyn OutputWriter,
+) -> anyhow::Result<()> {
+    let mut outputs: Vec<(PathBuf, String)> = Vec::new();
+
     // 渲染运行时模块
-    render_runtime_module()?;
+    outputs.push(render_runtime_module()?);
 
     let found_rpc = context.has_interfaces();
     // Render all type modules
     for module in &context.modules {
-        render_module(module)?;
+        outputs.push(render_module(module)?);
     }
 
     if found_rpc {
-        render_rpc_module()?;
-        render_websocket_module()?;
+        outputs.push(render_rpc_module()?);
+        outputs.push(render_websocket_module()?);
+    }
+
+    for (path, content) in outputs {
+        writer.write(&path, &content)?;
     }
 
     Ok(())
+}
+
+// 渲染所有模块（使用 FileWriter）
+pub fn render_elm_modules(context: &ElmContext) -> anyhow::Result<()> {
+    render_elm_modules_to(context, &FileWriter)
 }
 
 // 渲染运行时模块
-fn render_runtime_module() -> anyhow::Result<()> {
+fn render_runtime_module() -> anyhow::Result<(PathBuf, String)> {
     let runtime = RuntimeTemplate {};
     let content = runtime.render().expect("Failed to render runtime module");
-
-    let path = Path::new("Capnproto.elm");
-    let mut file = File::create(path)?;
-    write!(file, "{}", format_elm_code(&content))?;
-
-    Ok(())
+    Ok((PathBuf::from("Capnproto.elm"), content))
 }
 
 // 渲染 RPC 模块
-fn render_rpc_module() -> anyhow::Result<()> {
+fn render_rpc_module() -> anyhow::Result<(PathBuf, String)> {
     let rpc = RpcTemplate {};
     let content = rpc.render().expect("Failed to render runtime module");
-
-    let path = Path::new("Rpc/Client.elm");
-
-    // 确保目录存在
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut file = File::create(path)?;
-    write!(file, "{}", format_elm_code(&content))?;
-
-    Ok(())
+    Ok((PathBuf::from("Rpc/Client.elm"), content))
 }
 
 // Render WebSocket module
-fn render_websocket_module() -> anyhow::Result<()> {
+fn render_websocket_module() -> anyhow::Result<(PathBuf, String)> {
     let websocket = WebSocketTemplate {};
     let content = websocket
         .render()
         .expect("Failed to render WebSocket module");
-
-    let path = Path::new("Rpc/WebSocket.elm");
-
-    // Ensure directory exists
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut file = File::create(path)?;
-    write!(file, "{}", format_elm_code(&content))?;
-
-    Ok(())
+    Ok((PathBuf::from("Rpc/WebSocket.elm"), content))
 }
 
 // 渲染单个模块
-fn render_module(module: &ElmModule) -> anyhow::Result<()> {
+fn render_module(module: &ElmModule) -> anyhow::Result<(PathBuf, String)> {
     // 准备模块数据
     let full_module_name = format!("{}.{}", module.path, module.name);
     let exports = generate_exports(module);
@@ -171,18 +157,7 @@ fn render_module(module: &ElmModule) -> anyhow::Result<()> {
         .join("/");
     let file_name = format!("{}.elm", file_path);
 
-    let path = Path::new(&file_name);
-
-    // 确保目录存在
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    // 写入文件
-    let mut file = File::create(path)?;
-    write!(file, "{}", format_elm_code(&content))?;
-
-    Ok(())
+    Ok((PathBuf::from(&file_name), content))
 }
 
 // 渲染单个接口
@@ -260,23 +235,23 @@ fn generate_exports(module: &ElmModule) -> Vec<String> {
             // 添加字段访问器
             for field in &module.fields {
                 // 对于列表字段，添加计数和索引访问器
-                if let ElmType::List(_) = &field.elm_type {
+                if field.elm_type.is_list() {
                     exports.push(format!("get{}Count", field.name.to_upper_camel_case()));
                     exports.push(format!("get{}At", field.name.to_upper_camel_case()));
-                } else if let ElmType::AnyPointer = &field.elm_type {
+                } else if field.elm_type.is_anypointer() {
                     exports.push(format!("get{}Reader", field.name.to_upper_camel_case()));
                     exports.push(format!("get{}", field.name.to_upper_camel_case()));
-                } else if let ElmType::StructRef(_, _, _) = &field.elm_type {
+                } else if field.elm_type.is_struct_ref() {
                     exports.push(format!("get{}Reader", field.name.to_upper_camel_case()));
                     exports.push(format!("get{}", field.name.to_upper_camel_case()));
                 } else if let ElmType::UnionInline(branches, _) = &field.elm_type {
                     exports.push("Union(..)".to_owned());
                     for branch in branches {
-                        if !is_void_type(&branch.elm_type) {
+                        if !branch.elm_type.is_void() {
                             exports.push(format!("get{}", branch.name.to_upper_camel_case()));
-                            if is_struct_ref(&branch.elm_type)
-                                || is_anypointer_type(&branch.elm_type)
-                                || is_generic_param_type(&branch.elm_type)
+                            if branch.elm_type.is_struct_ref()
+                                || branch.elm_type.is_anypointer()
+                                || branch.elm_type.is_generic_param()
                             {
                                 exports.push(format!(
                                     "get{}Reader",
@@ -286,8 +261,8 @@ fn generate_exports(module: &ElmModule) -> Vec<String> {
                         }
                         exports.push(format!("is{}", branch.name.to_upper_camel_case()));
                     }
-                } else if !is_void_type(&field.elm_type)
-                    && elm_type_to_string(&field.elm_type) != "Union"
+                } else if !field.elm_type.is_void()
+                    && field.elm_type.to_elm_string() != "Union"
                 {
                     exports.push(format!("get{}", field.name.to_upper_camel_case()));
                 }
@@ -356,7 +331,7 @@ fn render_struct(module: &ElmModule) -> askama::Result<String> {
                 for branch in branches {
                     if branch.is_pointer {
                         found_pointer = true;
-                    } else if is_void_type(&branch.elm_type) {
+                    } else if branch.elm_type.is_void() {
                     } else {
                         found_data = true;
                     }
@@ -402,49 +377,6 @@ fn render_enum(module: &ElmModule) -> askama::Result<String> {
     enum_template.render()
 }
 
-fn is_text_type(elm_type: &ElmType) -> bool {
-    matches!(elm_type, ElmType::Primitive(ElmPrimitiveType::String))
-}
-
-fn is_data_type(elm_type: &ElmType) -> bool {
-    matches!(elm_type, ElmType::Primitive(ElmPrimitiveType::Bytes))
-}
-
-fn is_void_type(elm_type: &ElmType) -> bool {
-    matches!(elm_type, ElmType::Primitive(ElmPrimitiveType::Unit))
-}
-
-fn is_struct_ref(elm_type: &ElmType) -> bool {
-    matches!(elm_type, ElmType::StructRef(_, _, _))
-}
-
-fn is_interface_ref(elm_type: &ElmType) -> bool {
-    matches!(elm_type, ElmType::InterfaceRef(_, _, _))
-}
-
-fn is_pointer_type(elm_type: &ElmType) -> bool {
-    match elm_type {
-        ElmType::Primitive(ElmPrimitiveType::String) => true,
-        ElmType::Primitive(ElmPrimitiveType::Bytes) => true,
-        ElmType::Primitive(_) => false,
-        ElmType::List(_) => true,
-        ElmType::StructRef(_, _, _) => true,
-        ElmType::EnumRef(_, _, _, _) => false,
-        ElmType::InterfaceRef(_, _, _) => true,
-        ElmType::AnyPointer => true,
-        ElmType::UnionInline(..) => false,
-        ElmType::GenericParam(_) => true,
-    }
-}
-
-fn is_anypointer_type(elm_type: &ElmType) -> bool {
-    matches!(elm_type, ElmType::AnyPointer)
-}
-
-fn is_generic_param_type(elm_type: &ElmType) -> bool {
-    matches!(elm_type, ElmType::GenericParam(_))
-}
-
 // Askama 过滤器函数
 mod filters {
     use super::*;
@@ -479,21 +411,18 @@ mod filters {
         };
     }
 
+    // ── 类型字符串过滤器 ────────────────────────────────
+
     pub fn elm_type_str(elm_type: &ElmType) -> askama::Result<String> {
-        Ok(elm_type_to_string(elm_type))
+        Ok(elm_type.to_elm_string())
     }
 
     pub fn elm_type_module_str(elm_type: &ElmType) -> askama::Result<String> {
-        match elm_type {
-            ElmType::StructRef(m, _, _) => Ok(m.clone()),
-            ElmType::UnionInline(_, _) => Ok("Union".to_owned()),
-            ElmType::EnumRef(m, _, _, _) => Ok(m.clone()),
-            _ => Ok("".to_owned()),
-        }
+        Ok(elm_type.module_name())
     }
 
     pub fn parenthesize_if_needed(elm_type: &ElmType) -> askama::Result<String> {
-        let s = super::elm_type_to_string(elm_type);
+        let s = elm_type.to_elm_string();
         if s.contains(' ') {
             Ok(format!("({})", s))
         } else {
@@ -501,131 +430,83 @@ mod filters {
         }
     }
 
+    // ── 读写类型/字节宽度过滤器 ──────────────────────────
+
     pub fn elm_write_type(elm_type: &ElmType) -> askama::Result<String> {
-        let result = match elm_type {
-            ElmType::Primitive(ElmPrimitiveType::Bool) => "Bool".to_owned(),
-            ElmType::Primitive(ElmPrimitiveType::Int(bitwidth)) => match bitwidth {
-                8 => "UInt8".to_owned(),
-                16 => "UInt16".to_owned(),
-                32 => "UInt32".to_owned(),
-                64 => "UInt64".to_owned(),
-                _ => "UInt8".to_owned(),
-            },
-            ElmType::Primitive(ElmPrimitiveType::Float(bitwidth)) => match bitwidth {
-                32 => "Float32".to_owned(),
-                _ => "Float64".to_owned(),
-            },
-            _ => "Int".to_owned(),
-        };
-        Ok(result)
+        Ok(elm_type.write_type())
     }
 
     pub fn elm_read_type(elm_type: &ElmType) -> askama::Result<String> {
-        let result = match elm_type {
-            ElmType::Primitive(ElmPrimitiveType::Bool) => "Bool".to_owned(),
-            ElmType::Primitive(ElmPrimitiveType::Int(bitwidth)) => match bitwidth {
-                8 => "UInt8".to_owned(),
-                16 => "UInt16".to_owned(),
-                32 => "UInt32".to_owned(),
-                64 => "UInt64".to_owned(),
-                _ => "UInt8".to_owned(),
-            },
-            ElmType::Primitive(ElmPrimitiveType::Float(bitwidth)) => match bitwidth {
-                32 => "Float32".to_owned(),
-                _ => "Float64".to_owned(),
-            },
-            _ => "Int".to_owned(),
-        };
-        Ok(result)
+        Ok(elm_type.read_type())
     }
 
     pub fn elm_type_bytewidth(elm_type: &ElmType) -> askama::Result<u32> {
-        let result = match elm_type {
-            ElmType::Primitive(ElmPrimitiveType::Bool) => 0,
-            ElmType::Primitive(ElmPrimitiveType::Int(bitwidth)) => bitwidth / 8,
-            ElmType::Primitive(ElmPrimitiveType::Float(bitwidth)) => bitwidth / 8,
-            ElmType::Primitive(_) => 0,
-            ElmType::StructRef(_, _, _) => 0,
-            ElmType::EnumRef(_, _, _, _) => 0,
-            ElmType::InterfaceRef(_, _, _) => 0,
-            ElmType::AnyPointer => 0,
-            ElmType::List(_) => 0,
-            ElmType::UnionInline(_, _) => 0,
-            ElmType::GenericParam(_) => 0,
-        };
-        Ok(result as u32)
+        Ok(elm_type.byte_width())
     }
 
+    // ── 类型谓词过滤器（薄包装） ────────────────────────
+
     pub fn is_boolean_type(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(matches!(
-            elm_type,
-            ElmType::Primitive(ElmPrimitiveType::Bool)
-        ))
+        Ok(elm_type.is_boolean())
     }
 
     pub fn is_integer_type(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(matches!(
-            elm_type,
-            ElmType::Primitive(ElmPrimitiveType::Int(_))
-        ))
+        Ok(elm_type.is_integer())
     }
 
     pub fn is_float_type(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(matches!(
-            elm_type,
-            ElmType::Primitive(ElmPrimitiveType::Float(_))
-        ))
+        Ok(elm_type.is_float())
     }
 
     pub fn is_text_type(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(super::is_text_type(elm_type))
+        Ok(elm_type.is_text())
     }
 
     pub fn is_data_type(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(super::is_data_type(elm_type))
+        Ok(elm_type.is_data())
     }
 
     pub fn is_struct_ref(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(super::is_struct_ref(elm_type))
+        Ok(elm_type.is_struct_ref())
     }
 
     pub fn is_interface_ref(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(super::is_interface_ref(elm_type))
+        Ok(elm_type.is_interface_ref())
     }
 
     pub fn is_enum_ref(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(matches!(elm_type, ElmType::EnumRef(_, _, _, _)))
+        Ok(elm_type.is_enum_ref())
     }
 
     pub fn is_list_type(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(matches!(elm_type, ElmType::List(_)))
+        Ok(elm_type.is_list())
     }
 
     pub fn is_primitive_list(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(matches!(elm_type, ElmType::List(inner) if inner.is_primitive()))
+        Ok(elm_type.is_primitive_list())
     }
 
     pub fn is_union_type(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(matches!(elm_type, ElmType::UnionInline(..)))
+        Ok(elm_type.is_union())
     }
 
     pub fn is_anypointer_type(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(super::is_anypointer_type(elm_type))
+        Ok(elm_type.is_anypointer())
     }
 
     pub fn is_pointer_type(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(super::is_pointer_type(elm_type))
+        Ok(elm_type.is_pointer())
     }
 
     pub fn is_void_type(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(super::is_void_type(elm_type))
+        Ok(elm_type.is_void())
     }
 
     pub fn is_generic_param_type(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(super::is_generic_param_type(elm_type))
+        Ok(elm_type.is_generic_param())
     }
 
-    // --- Default value XOR mask filters ---
+    // ── 默认值 XOR mask 过滤器 ──────────────────────────
 
     /// Returns true if the field has a non-zero default value requiring XOR mask
     pub fn has_nonzero_default(field: &ElmField) -> askama::Result<bool> {
@@ -691,6 +572,8 @@ mod filters {
             .map_or("0".to_string(), |dv| dv.to_elm_literal()))
     }
 
+    // ── 类型解构过滤器 ──────────────────────────────────
+
     pub fn strip_list_type(elm_type: &ElmType) -> askama::Result<ElmType> {
         let result = match elm_type {
             ElmType::List(inner) => *inner.clone(),
@@ -715,65 +598,17 @@ mod filters {
         }
     }
 
+    // ── 编解码过滤器（委托 ElmType 方法） ────────────────
+
     pub fn type_to_encoder(elm_type: &ElmType) -> askama::Result<String> {
-        match elm_type {
-            ElmType::Primitive(ElmPrimitiveType::String) => {
-                Ok("Capnproto.textToAnyPointer".to_string())
-            }
-            ElmType::Primitive(ElmPrimitiveType::Bytes) => {
-                Ok("Capnproto.bytesToAnyPointer".to_string())
-            }
-            ElmType::Primitive(ElmPrimitiveType::Int(64)) => {
-                Ok("Capnproto.word64ToAnyPointer".to_string())
-            }
-            ElmType::StructRef(module, _, args) => {
-                let mut encoders: Vec<String> = Vec::new();
-                for arg in args {
-                    encoders.push(type_to_encoder(arg)?);
-                }
-                if encoders.is_empty() {
-                    Ok(format!("{}.toAnyPointer", module))
-                } else {
-                    Ok(encoders.join(" "))
-                }
-            }
-            ElmType::GenericParam(_) => Ok("toAnyPointer".to_string()),
-            ElmType::InterfaceRef(_, _, _) | ElmType::EnumRef(_, _, _, _) | ElmType::AnyPointer => {
-                Ok("identity".to_string())
-            }
-            _ => Ok("Capnproto.unknownTypeEncoder".to_string()),
-        }
+        Ok(elm_type.encoder_expr())
     }
 
     pub fn type_to_decoder(elm_type: &ElmType) -> askama::Result<String> {
-        match elm_type {
-            ElmType::Primitive(ElmPrimitiveType::String) => {
-                Ok("Capnproto.anyPointerToText".to_string())
-            }
-            ElmType::Primitive(ElmPrimitiveType::Bytes) => {
-                Ok("Capnproto.anyPointerToBytes".to_string())
-            }
-            ElmType::Primitive(ElmPrimitiveType::Int(64)) => {
-                Ok("Capnproto.anyPointerToWord64".to_string())
-            }
-            ElmType::StructRef(module, _, args) => {
-                let mut encoders: Vec<String> = Vec::new();
-                for arg in args {
-                    encoders.push(type_to_encoder(arg)?);
-                }
-                if encoders.is_empty() {
-                    Ok(format!("{}.fromAnyPointer", module))
-                } else {
-                    Ok(encoders.join(" "))
-                }
-            }
-            ElmType::GenericParam(_) => Ok("fromAnyPointer".to_string()),
-            ElmType::InterfaceRef(_, _, _) | ElmType::EnumRef(_, _, _, _) | ElmType::AnyPointer => {
-                Ok("Just".to_string())
-            }
-            _ => Ok("Capnproto.unknownTypeDecoder".to_string()),
-        }
+        Ok(elm_type.decoder_expr())
     }
+
+    // ── 联合分支计数过滤器 ──────────────────────────────
 
     pub fn pointer_branches_count(branches: &[ElmUnionBranch]) -> askama::Result<usize> {
         let mut count = 0;
@@ -788,7 +623,7 @@ mod filters {
     pub fn data_branches_count(branches: &[ElmUnionBranch]) -> askama::Result<usize> {
         let mut count = 0;
         for branch in branches {
-            if branch.is_pointer || is_void_type(&branch.elm_type).unwrap_or(false) {
+            if branch.is_pointer || branch.elm_type.is_void() {
                 continue;
             }
 
@@ -800,6 +635,8 @@ mod filters {
     pub fn branches_count(branches: &[ElmUnionBranch]) -> askama::Result<usize> {
         Ok(branches.len())
     }
+
+    // ── 命名工具过滤器 ──────────────────────────────────
 
     pub fn to_upper_camel_case(s: &str) -> askama::Result<String> {
         Ok(s.to_upper_camel_case())
@@ -815,6 +652,8 @@ mod filters {
             Ok(s.to_string())
         }
     }
+
+    // ── 列表编解码过滤器（委托 ElmType 方法） ────────────
 
     /// Returns the Capnproto list encoder function name for a list type
     pub fn list_encoder_name(elm_type: &ElmType) -> askama::Result<String> {
@@ -857,192 +696,11 @@ mod filters {
 
     /// Returns the full list encoder expression for use in templates
     pub fn list_encoder_expr(elm_type: &ElmType) -> askama::Result<String> {
-        match elm_type {
-            ElmType::List(inner) => match inner.as_ref() {
-                ElmType::Primitive(ElmPrimitiveType::Int(8)) => {
-                    Ok("Capnproto.encodePrimitiveIntList 1 1".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::Int(16)) => {
-                    Ok("Capnproto.encodePrimitiveIntList 3 2".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::Int(32)) => {
-                    Ok("Capnproto.encodePrimitiveIntList 4 4".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::Int(64)) => {
-                    Ok("Capnproto.encodePrimitiveIntList 5 8".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::Bool) => {
-                    Ok("Capnproto.encodeBoolList".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::Float(32)) => {
-                    Ok("Capnproto.encodeFloat32List".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::Float(64)) => {
-                    Ok("Capnproto.encodeFloat64List".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::String) => {
-                    Ok("Capnproto.encodeTextList".to_string())
-                }
-                ElmType::StructRef(module_name, _, _) => {
-                    if module_name.is_empty() {
-                        Ok("Capnproto.encodeStructList encode dataWords pointerWords".to_string())
-                    } else {
-                        Ok(format!(
-                            "Capnproto.encodeStructList {}.encode {}.dataWords {}.pointerWords",
-                            module_name, module_name, module_name
-                        ))
-                    }
-                }
-                _ => Ok("Capnproto.encodeStructList encode dataWords pointerWords".to_string()),
-            },
-            _ => Ok("Capnproto.encodeStructList encode dataWords pointerWords".to_string()),
-        }
+        Ok(elm_type.list_encoder_expr())
     }
 
     /// Returns the list element decoder expression for getXAt functions
     pub fn list_element_reader_expr(elm_type: &ElmType) -> askama::Result<String> {
-        match elm_type {
-            ElmType::List(inner) => match inner.as_ref() {
-                ElmType::Primitive(ElmPrimitiveType::Int(8)) => {
-                    Ok("\\r -> Capnproto.readUInt8 r 0".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::Int(16)) => {
-                    Ok("\\r -> Capnproto.readUInt16 r 0".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::Int(32)) => {
-                    Ok("\\r -> Capnproto.readUInt32 r 0".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::Int(64)) => {
-                    Ok("\\r -> Capnproto.readUInt64 r 0".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::Bool) => {
-                    Ok("\\r -> Capnproto.readBool r 0 0".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::Float(32)) => {
-                    Ok("\\r -> Capnproto.readFloat32 r 0".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::Float(64)) => {
-                    Ok("\\r -> Capnproto.readFloat64 r 0".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::String) => {
-                    Ok("\\r -> Capnproto.readText r 0".to_string())
-                }
-                ElmType::StructRef(module_name, _, _) => {
-                    if module_name.is_empty() {
-                        Ok("\\r -> decode r |> Result.toMaybe".to_string())
-                    } else {
-                        Ok(format!("\\r -> {}.decode r |> Result.toMaybe", module_name))
-                    }
-                }
-                ElmType::EnumRef(module_name, _, _, _) => {
-                    if module_name.is_empty() {
-                        Ok("\\r -> Capnproto.readUInt16 r 0".to_string())
-                    } else {
-                        Ok(format!(
-                            "\\r -> Capnproto.readUInt16 r 0 |> Maybe.andThen {}.fromCode",
-                            module_name
-                        ))
-                    }
-                }
-                _ => Ok("\\r -> Nothing".to_string()),
-            },
-            _ => Ok("\\r -> Nothing".to_string()),
-        }
-    }
-}
-fn elm_type_to_string(elm_type: &ElmType) -> String {
-    match elm_type {
-        ElmType::Primitive(ElmPrimitiveType::Bool) => "Bool".to_owned(),
-        ElmType::Primitive(ElmPrimitiveType::Int(64)) => "Capnproto.Word64".to_owned(),
-        ElmType::Primitive(ElmPrimitiveType::Int(_)) => "Int".to_owned(),
-        ElmType::Primitive(ElmPrimitiveType::Float(_)) => "Float".to_owned(),
-        ElmType::Primitive(ElmPrimitiveType::String) => "String".to_owned(),
-        ElmType::Primitive(ElmPrimitiveType::Bytes) => "Bytes.Bytes".to_owned(),
-        ElmType::Primitive(ElmPrimitiveType::Unit) => "".to_owned(),
-        ElmType::AnyPointer => "Capnproto.AnyPointer".to_owned(),
-        ElmType::InterfaceRef(_, _, _) => "Rpc.Capability".to_owned(),
-        ElmType::List(inner) => format!("List ({})", elm_type_to_string(inner)),
-        ElmType::StructRef(m, s, args) => {
-            let base = if m.is_empty() {
-                s.to_string()
-            } else {
-                format!("{}.{}", m, s)
-            };
-            render_with_args(&base, args)
-        }
-        ElmType::EnumRef(m, e, _, args) => {
-            let base = if m.is_empty() {
-                e.to_string()
-            } else {
-                format!("{}.{}", m, e)
-            };
-            render_with_args(&base, args)
-        }
-        ElmType::UnionInline(_, gps) => {
-            if gps.is_empty() {
-                "Union".to_owned()
-            } else if gps.len() > 1 {
-                format!("(Union {})", gps.join(" "))
-            } else {
-                format!("Union {}", gps.join(""))
-            }
-        }
-        ElmType::GenericParam(name) => name.clone(),
-    }
-}
-
-fn render_with_args(base: &str, args: &[ElmType]) -> String {
-    if args.is_empty() {
-        base.to_string()
-    } else {
-        let args_str = args
-            .iter()
-            .map(elm_type_to_string)
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!("{} {}", base, args_str)
-    }
-}
-
-/// Attempts to format Elm code using the elm-format command.
-///
-/// If elm-format is not found or fails, it returns the original code
-/// and prints a warning to stderr.
-fn format_elm_code(unformatted_code: &str) -> String {
-    match std::process::Command::new("elm-format")
-        .arg("--yes")
-        .arg("--stdin")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(mut child) => {
-            // Get stdin handle and write the unformatted code
-            if let Some(mut stdin) = child.stdin.take() {
-                if stdin.write_all(unformatted_code.as_bytes()).is_err() {
-                    return unformatted_code.to_string();
-                }
-            } else {
-                return unformatted_code.to_string();
-            }
-
-            // Wait for the process to finish and get output
-            match child.wait_with_output() {
-                Ok(output) => {
-                    if output.status.success() {
-                        match String::from_utf8(output.stdout) {
-                            Ok(formatted_code) => formatted_code,
-                            Err(_) => unformatted_code.to_string(),
-                        }
-                    } else {
-                        let _ = String::from_utf8_lossy(&output.stderr);
-                        unformatted_code.to_string()
-                    }
-                }
-                Err(_) => unformatted_code.to_string(),
-            }
-        }
-        Err(_) => unformatted_code.to_string(),
+        Ok(elm_type.list_element_reader_expr())
     }
 }

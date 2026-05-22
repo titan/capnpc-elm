@@ -136,24 +136,84 @@ pub struct RequestedFile {
     pub filename: String,
 }
 
+/// parse_node 的命名返回值，替代无名元组
+struct ParseNodeResult {
+    node: Node,
+    nested_node_ids: Vec<NodeId>,
+}
+
+/// parse_schema 的命名返回值，替代无名元组
+pub struct ParsedSchema {
+    pub nodes: Vec<Node>,
+    pub requested_files: Vec<RequestedFile>,
+}
+
 pub fn parse_schema(
     message_reader: &capnp::message::Reader<capnp::serialize::OwnedSegments>,
-) -> anyhow::Result<(Vec<Node>, Vec<RequestedFile>)> {
+) -> anyhow::Result<ParsedSchema> {
     let request = message_reader.get_root::<code_generator_request::Reader>()?;
 
+    // 第一遍：解析所有节点并记录父子关系
+    let (all_nodes, children_map) = collect_flat_nodes(&request)?;
+
+    // 解析请求的文件
+    let requested_files = collect_requested_files(&request)?;
+
+    // 构建节点到文件的映射（BFS 遍历）
+    let node_to_file_map = resolve_file_ids(&requested_files, &children_map);
+
+    // 为节点设置 file_id
+    let mut all_nodes = all_nodes;
+    for node in all_nodes.values_mut() {
+        node.file_id = *node_to_file_map.get(&node.id).unwrap_or(&0);
+    }
+
+    // 第二遍：构建嵌套结构
+    let root_nodes = build_nested_structure(&mut all_nodes, &children_map, 0);
+
+    // 第三遍：过滤无用节点
+    let nodes = filter_root_nodes(root_nodes);
+
+    Ok(ParsedSchema {
+        nodes,
+        requested_files,
+    })
+}
+
+/// 解析请求的文件列表
+fn collect_requested_files(
+    request: &code_generator_request::Reader,
+) -> Result<Vec<RequestedFile>> {
+    let files_reader = request.get_requested_files()?;
+    let mut requested_files = Vec::with_capacity(files_reader.len() as usize);
+    for i in 0..files_reader.len() {
+        let file_reader = files_reader.get(i);
+        let id = file_reader.get_id();
+        let filename = file_reader.get_filename()?.to_string()?;
+        requested_files.push(RequestedFile { id, filename });
+    }
+    Ok(requested_files)
+}
+
+/// 第一遍扫描：解析所有平面节点，记录父子关系和嵌套节点映射
+fn collect_flat_nodes(
+    request: &code_generator_request::Reader,
+) -> Result<(HashMap<u64, Node>, HashMap<u64, Vec<u64>>)> {
     let nodes_reader = request.get_nodes()?;
     let mut all_nodes: HashMap<u64, Node> = HashMap::with_capacity(nodes_reader.len() as usize);
     let mut children_map: HashMap<u64, Vec<u64>> =
         HashMap::with_capacity(nodes_reader.len() as usize);
     let mut nested_nodes_map = HashMap::new();
 
-    // 第一遍：解析所有节点并记录父子关系
     for i in 0..nodes_reader.len() {
         let node_reader = nodes_reader.get(i);
         let id = node_reader.get_id();
         let scope_id = node_reader.get_scope_id();
 
-        let (mut node, nested_node_ids) = parse_node(node_reader)?;
+        let ParseNodeResult {
+            mut node,
+            nested_node_ids,
+        } = parse_node(node_reader)?;
         node.parent_id = scope_id;
 
         nested_nodes_map.insert(id, nested_node_ids);
@@ -183,50 +243,47 @@ pub fn parse_schema(
         }
     }
 
-    // 解析请求的文件
-    let files_reader = request.get_requested_files()?;
-    let mut requested_files = Vec::with_capacity(files_reader.len() as usize);
-    for i in 0..files_reader.len() {
-        let file_reader = files_reader.get(i);
-        let id = file_reader.get_id();
-        let filename = file_reader.get_filename()?.to_string()?;
+    Ok((all_nodes, children_map))
+}
 
-        requested_files.push(RequestedFile { id, filename });
-    }
+/// BFS 遍历，为每个节点解析其所属文件 ID
+fn resolve_file_ids(
+    requested_files: &[RequestedFile],
+    children_map: &HashMap<u64, Vec<u64>>,
+) -> HashMap<u64, FileId> {
+    let mut node_to_file_map: HashMap<u64, FileId> = HashMap::new();
 
-    // 构建节点到文件的映射
-    let mut node_to_file_map = HashMap::new();
     // 文件根节点映射到自己
-    for file in &requested_files {
+    for file in requested_files {
         node_to_file_map.insert(file.id, file.id);
     }
 
-    // BFS遍历所有节点，继承父节点的文件ID
-    let mut queue = VecDeque::new();
-    for file in &requested_files {
+    // BFS 遍历所有节点，继承父节点的文件 ID
+    let mut queue: VecDeque<(u64, u64)> = VecDeque::new(); // (node_id, parent_id)
+    for file in requested_files {
         if let Some(children) = children_map.get(&file.id) {
-            queue.extend(children.iter().copied());
-        }
-    }
-    while let Some(node_id) = queue.pop_front() {
-        if let Some(node) = all_nodes.get(&node_id) {
-            if let Some(&file_id) = node_to_file_map.get(&node.parent_id) {
-                node_to_file_map.insert(node_id, file_id);
+            for &child_id in children {
+                queue.push_back((child_id, file.id));
             }
         }
+    }
+
+    while let Some((node_id, parent_id)) = queue.pop_front() {
+        if let Some(&file_id) = node_to_file_map.get(&parent_id) {
+            node_to_file_map.insert(node_id, file_id);
+        }
         if let Some(children) = children_map.get(&node_id) {
-            queue.extend(children.iter().copied());
+            for &child_id in children {
+                queue.push_back((child_id, node_id));
+            }
         }
     }
-    // 为节点设置 file_id
-    for node in all_nodes.values_mut() {
-        node.file_id = *node_to_file_map.get(&node.id).unwrap_or(&0);
-    }
 
-    // 第二遍：构建嵌套结构
-    let root_nodes = build_nested_structure(&mut all_nodes, &children_map, 0);
+    node_to_file_map
+}
 
-    // 第三遍：过滤无用节点
+/// 第三遍：过滤掉 File/Annotation/Other 等无用根节点
+fn filter_root_nodes(root_nodes: Vec<Node>) -> Vec<Node> {
     let mut nodes = Vec::new();
     for n in root_nodes {
         match n.kind {
@@ -240,8 +297,7 @@ pub fn parse_schema(
             _ => nodes.push(n),
         }
     }
-
-    Ok((nodes, requested_files))
+    nodes
 }
 
 fn build_nested_structure(
@@ -268,7 +324,7 @@ fn build_nested_structure(
         .collect()
 }
 
-fn parse_node(reader: capnp::schema_capnp::node::Reader) -> anyhow::Result<(Node, Vec<NodeId>)> {
+fn parse_node(reader: capnp::schema_capnp::node::Reader) -> anyhow::Result<ParseNodeResult> {
     let id = reader.get_id();
     let scope_id = reader.get_scope_id();
     let display_name = reader.get_display_name()?.to_string()?;
@@ -385,8 +441,8 @@ fn parse_node(reader: capnp::schema_capnp::node::Reader) -> anyhow::Result<(Node
         nested_node_ids.push(nested_nodes_reader.get(i).get_id());
     }
 
-    Ok((
-        Node {
+    Ok(ParseNodeResult {
+        node: Node {
             id,
             display_name,
             kind,
@@ -396,7 +452,7 @@ fn parse_node(reader: capnp::schema_capnp::node::Reader) -> anyhow::Result<(Node
             generic_params,
         },
         nested_node_ids, // 返回嵌套节点ID列表
-    ))
+    })
 }
 
 fn parse_field(reader: capnp::schema_capnp::field::Reader) -> anyhow::Result<Field> {

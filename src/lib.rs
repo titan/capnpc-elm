@@ -6,7 +6,9 @@ use std::process::{Command, Stdio};
 mod binding;
 mod capnproto;
 mod elm;
+mod output;
 mod render;
+mod type_mapping;
 
 /// Search standard system include paths for capnp/rpc.capnp
 fn find_rpc_schema() -> Option<PathBuf> {
@@ -24,8 +26,8 @@ fn find_rpc_schema() -> Option<PathBuf> {
 }
 
 /// Compile rpc.capnp via `capnp compile -o-` and parse the resulting
-/// CodeGeneratorRequest into (nodes, requested_files).
-fn load_rpc_schema() -> anyhow::Result<(Vec<capnproto::Node>, Vec<capnproto::RequestedFile>)> {
+/// CodeGeneratorRequest into ParsedSchema.
+fn load_rpc_schema() -> anyhow::Result<capnproto::ParsedSchema> {
     let rpc_path = find_rpc_schema()
         .context("capnp/rpc.capnp not found in /usr/include or /usr/local/include")?;
 
@@ -47,32 +49,53 @@ fn load_rpc_schema() -> anyhow::Result<(Vec<capnproto::Node>, Vec<capnproto::Req
     let message = capnp::serialize::read_message(&mut cursor, Default::default())
         .context("failed to parse rpc.capnp CodeGeneratorRequest")?;
 
-    let (nodes, requested_files) =
-        capnproto::parse_schema(&message).context("failed to parse rpc.capnp schema")?;
+    let schema = capnproto::parse_schema(&message).context("failed to parse rpc.capnp schema")?;
 
-    Ok((nodes, requested_files))
+    Ok(schema)
+}
+
+/// 第一阶段：从 BufRead 解析 Cap'n Proto CodeGeneratorRequest，返回 ParsedSchema
+pub fn parse_request<R: BufRead>(reader: R) -> anyhow::Result<capnproto::ParsedSchema> {
+    let message = capnp::serialize::read_message(reader, Default::default())
+        .context("Failed to read CodeGeneratorRequest")?;
+    capnproto::parse_schema(&message)
+        .context("Failed to parse CodeGeneratorRequest")
+}
+
+/// 第二阶段：将 ParsedSchema 绑定为 Elm IR 上下文
+/// rpc_schema 可选注入；传 None 时若存在 interface 则自动加载
+pub fn bind_to_elm(
+    schema: &capnproto::ParsedSchema,
+    rpc_schema: Option<&capnproto::ParsedSchema>,
+) -> anyhow::Result<elm::ElmContext> {
+    let mut context = binding::generate_elm_context(&schema.nodes, &schema.requested_files);
+    if context.has_interfaces() {
+        let rpc = match rpc_schema {
+            Some(preloaded) => preloaded,
+            None => &load_rpc_schema()?,
+        };
+        binding::append_rpc_modules(&mut context, &rpc.nodes, &rpc.requested_files);
+    }
+    Ok(context)
+}
+
+/// 第三阶段：将 ElmContext 渲染为 .elm 文件
+pub fn render_elm(context: &elm::ElmContext) -> anyhow::Result<()> {
+    render::render_elm_modules(context).with_context(|| "Failed to render modules")
+}
+
+/// 第三阶段变体：将 ElmContext 渲染到自定义 OutputWriter
+pub fn render_elm_to(
+    context: &elm::ElmContext,
+    writer: &dyn output::OutputWriter,
+) -> anyhow::Result<()> {
+    render::render_elm_modules_to(context, writer).with_context(|| "Failed to render modules")
 }
 
 /// Parse Cap'n Proto CodeGeneratorRequest and generate Elm code
 pub fn generate_elm_code<R: BufRead>(reader: R) -> anyhow::Result<()> {
-    // Parse the main request
-    let message = capnp::serialize::read_message(reader, Default::default())
-        .context("Failed to read CodeGeneratorRequest")?;
-
-    let (nodes, requested_files) =
-        crate::capnproto::parse_schema(&message).context("Failed to parse CodeGeneratorRequest")?;
-
-    // Build Elm context from user schema
-    let mut context = binding::generate_elm_context(&nodes, &requested_files);
-
-    // If user schema has interfaces, auto-load rpc.capnp and generate RPC type modules
-    if context.has_interfaces() {
-        let (rpc_nodes, rpc_files) = load_rpc_schema()?;
-        binding::append_rpc_modules(&mut context, &rpc_nodes, &rpc_files);
-    }
-
-    // Render Elm modules
-    render::render_elm_modules(&context).with_context(|| "Failed to render modules")?;
-
+    let schema = parse_request(reader)?;
+    let context = bind_to_elm(&schema, None)?;
+    render_elm(&context)?;
     Ok(())
 }

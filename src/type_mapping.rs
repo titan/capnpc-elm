@@ -254,7 +254,7 @@ impl<'a> TypeMappingContext<'a> {
                 }
             }
             ElmType::InterfaceRef(_, _, brands) => {
-                imports.push("Capnp.Rpc.Client as Rpc".to_owned());
+                imports.push("Rpc.Client as Rpc".to_owned());
                 for brand in brands {
                     Self::collect_imports_from_type(brand, imports);
                 }
@@ -411,10 +411,7 @@ impl<'a> TypeMappingContext<'a> {
                 key
             }
             Type::List(inner) => {
-                format!(
-                    "List:{}",
-                    self.type_to_cache_key(inner, current_node_id)
-                )
+                format!("List:{}", self.type_to_cache_key(inner, current_node_id))
             }
             Type::GenericParam(index) => {
                 if let Some(node) = self.node_map.get(&current_node_id) {

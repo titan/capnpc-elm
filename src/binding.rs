@@ -1,7 +1,5 @@
 use crate::capnproto::{Field, Node, NodeKind, RequestedFile, Type};
-use crate::elm::{
-    ElmContext, ElmField, ElmMethod, ElmModule, ElmType, ElmTypeDef, ElmUnionBranch,
-};
+use crate::elm::{ElmContext, ElmField, ElmMethod, ElmModule, ElmType, ElmTypeDef, ElmUnionBranch};
 use crate::type_mapping::TypeMappingContext;
 use heck::ToLowerCamelCase;
 use std::collections::HashMap;
@@ -52,11 +50,7 @@ pub fn append_rpc_modules(
 }
 
 /// 将 Cap'n Proto 节点转换为 Elm 模块
-fn convert_node_to_elm(
-    node: &Node,
-    context: &mut ElmContext,
-    ctx: &mut TypeMappingContext,
-) {
+fn convert_node_to_elm(node: &Node, context: &mut ElmContext, ctx: &mut TypeMappingContext) {
     // 直接获取完整模块路径
     let full_module_name = ctx.get_full_type_name(node.id);
 
@@ -105,7 +99,7 @@ fn convert_node_to_elm(
             });
         }
         imports.push("Capnproto".to_owned());
-        imports.push("Capnp.Rpc.Client as Rpc".to_owned());
+        imports.push("Rpc.Client as Rpc".to_owned());
 
         // 去重导入
         imports.sort();
@@ -179,7 +173,10 @@ fn convert_node_to_elm(
                     default_value: None,
                 };
 
-                TypeMappingContext::collect_imports_from_type(&unnamed_union.elm_type, &mut imports);
+                TypeMappingContext::collect_imports_from_type(
+                    &unnamed_union.elm_type,
+                    &mut imports,
+                );
 
                 fields.push(unnamed_union);
             } else {

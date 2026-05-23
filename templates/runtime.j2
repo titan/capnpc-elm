@@ -7,6 +7,7 @@ module Capnproto exposing
     , PointerOffset
     , PointerWriteInfo(..)
     , Reader
+    , SegmentInfo
     , SegmentBuilder
     , StructLayout
     , Word64
@@ -976,7 +977,7 @@ encodeStructPointerContent info sourceBytes builder structOffset fieldOffset =
 
         -- 递归处理指针部分
         sourceReader =
-            { bytes = sourceBytes, baseOffset = info.target.baseOffset }
+            { bytes = sourceBytes, baseOffset = info.target.baseOffset, segments = info.target.segments }
 
         builder3 =
             processStructPointers sourceReader builder2 targetOffset info.dataWords info.pointerWords 0
@@ -1091,7 +1092,7 @@ encodeCompositeListContent info sourceBytes builder structOffset fieldOffset =
 
         -- 递归处理每个复合元素
         sourceReader =
-            { bytes = sourceBytes, baseOffset = info.target.baseOffset + wordSize }
+            { bytes = sourceBytes, baseOffset = info.target.baseOffset + wordSize, segments = info.target.segments }
 
         builder3 =
             processCompositeListElements sourceReader builder2 targetOffset info 0
@@ -1120,7 +1121,7 @@ encodePointerListContent info sourceBytes builder structOffset fieldOffset =
             allocateBytes listSize builder
 
         sourceReader =
-            { bytes = sourceBytes, baseOffset = info.target.baseOffset }
+            { bytes = sourceBytes, baseOffset = info.target.baseOffset, segments = info.target.segments }
 
         builder2 =
             processPointerListElements sourceReader builder1 targetOffset info 0
@@ -1935,9 +1936,16 @@ builderSegmentToBytes builder =
 -- 解码相关类型
 
 
+type alias SegmentInfo =
+    { startOffset : Int
+    , sizeBytes : Int
+    }
+
+
 type alias Reader =
     { bytes : Bytes
     , baseOffset : Int
+    , segments : Dict Int SegmentInfo
     }
 
 
@@ -1947,21 +1955,81 @@ type alias Reader =
 
 createReader : Bytes -> Reader
 createReader bytes =
-    let
-        -- 简化：假设只有一个段
-        headerSize =
-            wordSize
+    case parseFrameHeader bytes of
+        Just { headerSize, segments } ->
+            let
+                rootReader =
+                    { bytes = bytes
+                    , baseOffset = headerSize
+                    , segments = segments
+                    }
+            in
+            case readPointer rootReader 0 of
+                Just info ->
+                    info.target
 
-        -- 读取根指针，获取根对象位置
-        rootPointerOffset =
-            headerSize
-    in
-    case readPointer { bytes = bytes, baseOffset = rootPointerOffset } 0 of
-        Just info ->
-            info.target
+                Nothing ->
+                    rootReader
 
         Nothing ->
-            { bytes = bytes, baseOffset = headerSize + wordSize }
+            { bytes = bytes
+            , baseOffset = wordSize
+            , segments = Dict.singleton 0 { startOffset = wordSize, sizeBytes = Bytes.width bytes - wordSize }
+            }
+
+
+parseFrameHeader : Bytes -> Maybe { headerSize : Int, segments : Dict Int SegmentInfo }
+parseFrameHeader bytes =
+    BD.decode frameHeaderDecoder bytes
+
+
+frameHeaderDecoder : BD.Decoder { headerSize : Int, segments : Dict Int SegmentInfo }
+frameHeaderDecoder =
+    BD.unsignedInt32 Bytes.LE
+        |> BD.andThen
+            (\rawCount ->
+                let
+                    count =
+                        rawCount + 1
+                in
+                BD.loop ( 0, [] ) (sizeReaderStep count)
+                    |> BD.map
+                        (\sizes ->
+                            let
+                                headerSize =
+                                    ((2 + count) // 2) * 8
+
+                                segments =
+                                    buildSegmentDict sizes headerSize
+                            in
+                            { headerSize = headerSize, segments = segments }
+                        )
+            )
+
+
+sizeReaderStep : Int -> ( Int, List Int ) -> BD.Decoder (BD.Step ( Int, List Int ) (List Int))
+sizeReaderStep count ( idx, acc ) =
+    if idx >= count then
+        BD.succeed (BD.Done (List.reverse acc))
+
+    else
+        BD.unsignedInt32 Bytes.LE
+            |> BD.map (\sz -> BD.Loop ( idx + 1, sz :: acc ))
+
+
+buildSegmentDict : List Int -> Int -> Dict Int SegmentInfo
+buildSegmentDict wordSizes headerSize =
+    List.foldl
+        (\ws ( idx, offset, dict ) ->
+            let
+                sizeBytes =
+                    ws * 8
+            in
+            ( idx + 1, offset + sizeBytes, Dict.insert idx { startOffset = offset, sizeBytes = sizeBytes } dict )
+        )
+        ( 0, headerSize, Dict.empty )
+        wordSizes
+        |> (\( _, _, d ) -> d)
 
 
 
@@ -2184,9 +2252,103 @@ readPointer reader offset =
                                 , isComposite = False
                                 }
 
+                    else if pointerType == 2 then
+                        -- Far pointer (inter-segment)
+                        let
+                            landingPad =
+                                Bitwise.and (Bitwise.shiftRightZfBy 2 low) 1
+
+                            farOffsetWords =
+                                Bitwise.shiftRightZfBy 3 low
+
+                            targetSegmentId =
+                                high
+                        in
+                        case Dict.get targetSegmentId reader.segments of
+                            Just segment ->
+                                let
+                                    absoluteOffset =
+                                        segment.startOffset + farOffsetWords * 8
+                                in
+                                if absoluteOffset < 0 || absoluteOffset + 8 > Bytes.width reader.bytes then
+                                    Nothing
+
+                                else if landingPad == 0 then
+                                    -- Single-word landing pad: resolve pointer at absoluteOffset
+                                    readPointer { reader | baseOffset = absoluteOffset } 0
+
+                                else
+                                    -- Double-word landing pad
+                                    resolveDoubleWordLandingPad reader absoluteOffset
+
+                            Nothing ->
+                                Nothing
+
                     else
                         Nothing
             )
+
+
+resolveDoubleWordLandingPad : Reader -> Int -> Maybe PointerInfo
+resolveDoubleWordLandingPad reader absoluteOffset =
+    let
+        landingReader =
+            { reader | baseOffset = absoluteOffset }
+    in
+    case readUInt64 landingReader 0 of
+        Just innerFar ->
+            let
+                innerType =
+                    Bitwise.and innerFar.low 3
+            in
+            if innerType /= 2 then
+                Nothing
+
+            else
+                let
+                    innerOffsetWords =
+                        Bitwise.shiftRightZfBy 3 innerFar.low
+
+                    innerSegmentId =
+                        innerFar.high
+                in
+                case Dict.get innerSegmentId reader.segments of
+                    Just innerSegment ->
+                        let
+                            actualOffset =
+                                innerSegment.startOffset + innerOffsetWords * 8
+                        in
+                        if actualOffset < 0 || actualOffset + 8 > Bytes.width reader.bytes then
+                            Nothing
+
+                        else
+                            case readUInt64 landingReader 8 of
+                                Just tag ->
+                                    let
+                                        tagDataWords =
+                                            Bitwise.and tag.high 0xFFFF
+
+                                        tagPointerWords =
+                                            Bitwise.shiftRightZfBy 16 tag.high
+                                    in
+                                    Just
+                                        { target = { reader | baseOffset = actualOffset }
+                                        , pointerType = StructPointer
+                                        , dataWords = tagDataWords
+                                        , pointerWords = tagPointerWords
+                                        , elementType = 0
+                                        , elementCount = 0
+                                        , isComposite = False
+                                        }
+
+                                Nothing ->
+                                    Nothing
+
+                    Nothing ->
+                        Nothing
+
+        Nothing ->
+            Nothing
 
 
 {-| 文本读取函数
@@ -2286,6 +2448,7 @@ readList reader offset elementDecoder =
                                 in
                                 { bytes = info.target.bytes
                                 , baseOffset = elementOffset
+                                , segments = info.target.segments
                                 }
                         in
                         List.range 0 (info.elementCount - 1)

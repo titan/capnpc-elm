@@ -1,5 +1,5 @@
 use anyhow::Context;
-use std::io::{BufRead, Read};
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -58,8 +58,7 @@ fn load_rpc_schema() -> anyhow::Result<capnproto::ParsedSchema> {
 pub fn parse_request<R: BufRead>(reader: R) -> anyhow::Result<capnproto::ParsedSchema> {
     let message = capnp::serialize::read_message(reader, Default::default())
         .context("Failed to read CodeGeneratorRequest")?;
-    capnproto::parse_schema(&message)
-        .context("Failed to parse CodeGeneratorRequest")
+    capnproto::parse_schema(&message).context("Failed to parse CodeGeneratorRequest")
 }
 
 /// 第二阶段：将 ParsedSchema 绑定为 Elm IR 上下文

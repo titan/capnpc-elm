@@ -160,14 +160,6 @@ impl<'a> TypeMappingContext<'a> {
     /// 获取节点的完整类型名称
     pub fn get_full_type_name(&self, node_id: u64) -> String {
         if let Some(node) = self.node_map.get(&node_id) {
-            if node.display_name.contains("Message") && node.display_name.contains("rpc") {
-                eprintln!(
-                    "DEBUG get_full_type_name: display_name={}, file_id={}, file={:?}",
-                    node.display_name,
-                    node.file_id,
-                    self.file_id_to_file.get(&node.file_id).map(|f| &f.filename)
-                );
-            }
             let full_path = node
                 .display_name
                 .split(':')

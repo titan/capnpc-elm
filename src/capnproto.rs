@@ -181,9 +181,7 @@ pub fn parse_schema(
 }
 
 /// 解析请求的文件列表
-fn collect_requested_files(
-    request: &code_generator_request::Reader,
-) -> Result<Vec<RequestedFile>> {
+fn collect_requested_files(request: &code_generator_request::Reader) -> Result<Vec<RequestedFile>> {
     let files_reader = request.get_requested_files()?;
     let mut requested_files = Vec::with_capacity(files_reader.len() as usize);
     for i in 0..files_reader.len() {

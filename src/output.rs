@@ -26,10 +26,12 @@ impl OutputWriter for FileWriter {
 }
 
 /// 内存写入器：收集内容到 HashMap（无格式化，便于测试）
+#[allow(dead_code)]
 pub struct MemoryWriter {
     contents: RefCell<HashMap<PathBuf, String>>,
 }
 
+#[allow(dead_code)]
 impl MemoryWriter {
     pub fn new() -> Self {
         Self {

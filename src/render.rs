@@ -31,15 +31,13 @@ struct StructTemplate<'a> {
 
 #[derive(Template)]
 #[template(path = "enum.j2", escape = "none")]
-struct EnumTemplate<'a> {
-    module: &'a ElmModule,
+struct EnumTemplate {
     variants: Vec<ElmEnumVariant>,
 }
 
 #[derive(Template)]
 #[template(path = "interface.j2", escape = "none")]
 struct InterfaceTemplate<'a> {
-    module: &'a ElmInterface,
     interface_high: &'a str,
     interface_low: &'a str,
     methods: &'a [ElmMethod],
@@ -174,28 +172,12 @@ fn render_interface(module: &ElmModule) -> askama::Result<String> {
     let low = format!("0x{:08X}", (interface.id & 0xFFFFFFFF) as u32);
 
     let template = InterfaceTemplate {
-        module: &interface,
         interface_high: &high,
         interface_low: &low,
         methods: &interface.methods,
     };
 
     template.render()
-}
-
-// 提取联合分支
-fn extract_union_branches(fields: &[ElmField]) -> Vec<ElmUnionBranch> {
-    fields
-        .iter()
-        .filter_map(|field| {
-            if let ElmType::UnionInline(ref branches, _) = field.elm_type {
-                Some(branches.clone())
-            } else {
-                None
-            }
-        })
-        .flatten()
-        .collect()
 }
 
 // 提取 Enum Variant
@@ -222,11 +204,6 @@ fn generate_exports(module: &ElmModule) -> Vec<String> {
             exports.push("Entity".to_string());
             exports.push("dataWords".to_string());
             exports.push("pointerWords".to_string());
-            eprintln!(
-                "DEBUG exports for {}: dataWords, pointerWords added, total={}",
-                module.name,
-                exports.len()
-            );
             exports.push("encode".to_string());
             exports.push("decode".to_string());
             exports.push("toAnyPointer".to_string());
@@ -261,9 +238,7 @@ fn generate_exports(module: &ElmModule) -> Vec<String> {
                         }
                         exports.push(format!("is{}", branch.name.to_upper_camel_case()));
                     }
-                } else if !field.elm_type.is_void()
-                    && field.elm_type.to_elm_string() != "Union"
-                {
+                } else if !field.elm_type.is_void() && field.elm_type.to_elm_string() != "Union" {
                     exports.push(format!("get{}", field.name.to_upper_camel_case()));
                 }
             }
@@ -372,7 +347,7 @@ fn render_struct(module: &ElmModule) -> askama::Result<String> {
 fn render_enum(module: &ElmModule) -> askama::Result<String> {
     let variants = extract_enum_variants(&module.fields);
 
-    let enum_template = EnumTemplate { module, variants };
+    let enum_template = EnumTemplate { variants };
 
     enum_template.render()
 }
@@ -482,20 +457,12 @@ mod filters {
         Ok(elm_type.is_list())
     }
 
-    pub fn is_primitive_list(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(elm_type.is_primitive_list())
-    }
-
     pub fn is_union_type(elm_type: &ElmType) -> askama::Result<bool> {
         Ok(elm_type.is_union())
     }
 
     pub fn is_anypointer_type(elm_type: &ElmType) -> askama::Result<bool> {
         Ok(elm_type.is_anypointer())
-    }
-
-    pub fn is_pointer_type(elm_type: &ElmType) -> askama::Result<bool> {
-        Ok(elm_type.is_pointer())
     }
 
     pub fn is_void_type(elm_type: &ElmType) -> askama::Result<bool> {
@@ -654,45 +621,6 @@ mod filters {
     }
 
     // ── 列表编解码过滤器（委托 ElmType 方法） ────────────
-
-    /// Returns the Capnproto list encoder function name for a list type
-    pub fn list_encoder_name(elm_type: &ElmType) -> askama::Result<String> {
-        match elm_type {
-            ElmType::List(inner) => match inner.as_ref() {
-                ElmType::Primitive(ElmPrimitiveType::Int(_)) => {
-                    Ok("Capnproto.encodePrimitiveIntList".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::Bool) => {
-                    Ok("Capnproto.encodeBoolList".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::Float(_)) => {
-                    Ok("Capnproto.encodePrimitiveList".to_string())
-                }
-                ElmType::Primitive(ElmPrimitiveType::String) => {
-                    Ok("Capnproto.encodeTextList".to_string())
-                }
-                ElmType::StructRef(_, _, _) => Ok("Capnproto.encodeStructList".to_string()),
-                _ => Ok("Capnproto.encodeStructList".to_string()),
-            },
-            _ => Ok("Capnproto.encodeStructList".to_string()),
-        }
-    }
-
-    /// Returns true if the list element type needs a struct-style encoder
-    pub fn is_struct_list(elm_type: &ElmType) -> askama::Result<bool> {
-        match elm_type {
-            ElmType::List(inner) => Ok(matches!(inner.as_ref(), ElmType::StructRef(_, _, _))),
-            _ => Ok(false),
-        }
-    }
-
-    /// Returns true if the list element type is a primitive (non-struct)
-    pub fn is_primitive_list_type(elm_type: &ElmType) -> askama::Result<bool> {
-        match elm_type {
-            ElmType::List(inner) => Ok(matches!(inner.as_ref(), ElmType::Primitive(_))),
-            _ => Ok(false),
-        }
-    }
 
     /// Returns the full list encoder expression for use in templates
     pub fn list_encoder_expr(elm_type: &ElmType) -> askama::Result<String> {

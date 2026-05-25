@@ -136,14 +136,13 @@ fn convert_node_to_elm(node: &Node, context: &mut ElmContext, ctx: &mut TypeMapp
 
     let type_def = match &node.kind {
         NodeKind::Struct {
-            is_group,
+            is_group: _,
             fields: capnp_fields,
             data_word_count,
             pointer_word_count,
             union_fields,
             discriminant_offset: offset,
         } => {
-            eprintln!("DEBUG: node={} kind={:?}", node.display_name, node.kind);
             data_words = *data_word_count as u32;
             pointer_words = *pointer_word_count as u32;
             discriminant_offset = *offset;
@@ -181,11 +180,6 @@ fn convert_node_to_elm(node: &Node, context: &mut ElmContext, ctx: &mut TypeMapp
                 fields.push(unnamed_union);
             } else {
                 // 处理内联的联合体节点（有命名的内嵌union）
-                eprintln!(
-                    "DEBUG: checking nested nodes for {} ({} nested)",
-                    node.display_name,
-                    node.nested_nodes.len()
-                );
                 for nested in &node.nested_nodes {
                     if let NodeKind::Struct {
                         is_group: true,
@@ -224,12 +218,6 @@ fn convert_node_to_elm(node: &Node, context: &mut ElmContext, ctx: &mut TypeMapp
                             &named_union.elm_type,
                             &mut imports,
                         );
-                        eprintln!(
-                            "DEBUG named_union for {}: branches={:?}",
-                            TypeMappingContext::extract_type_name(&nested.display_name),
-                            named_union.elm_type
-                        );
-
                         fields.push(named_union);
                     }
                 }

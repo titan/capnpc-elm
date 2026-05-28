@@ -1,0 +1,42 @@
+module {{ full_module_name }}.Server exposing
+    ( interfaceId
+    , Handlers
+    , makeDispatcher
+    )
+
+import Capnproto
+import Rpc.Client as Rpc
+{% for imp in imports %}
+import {{ imp }}{% endfor %}
+
+
+interfaceId : Capnproto.Word64
+interfaceId =
+    Capnproto.toWord64 {{ interface_high }} {{ interface_low }}
+
+{% for method in methods %}
+{% if loop.first %}type alias Handlers msg =
+    { {{ method.name }}
+{% else %}    , {{ method.name }}
+{% endif %}        : {{ method.param_module }}.Entity
+        -> ({{ method.result_module }}.Entity -> Cmd msg)
+        -> msg
+{% endfor %}
+    }
+
+
+makeDispatcher : Handlers msg -> Rpc.ServerHandler msg
+makeDispatcher handlers methodId payloadReader replyFn =
+    case methodId of
+{% for method in methods %}
+        {{ method.id }} ->
+            case {{ method.param_module }}.decode payloadReader of
+                Ok params ->
+                    Ok (handlers.{{ method.name }} params (\results -> replyFn ({{ method.result_module }}.encode results)))
+
+                Err err ->
+                    Err ("Failed to decode params for {{ method.name }}: " ++ err)
+
+{% endfor %}
+        _ ->
+            Err ("Unknown method: " ++ String.fromInt methodId)

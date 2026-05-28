@@ -55,6 +55,26 @@ struct RpcTemplate;
 #[template(path = "websocket.j2", escape = "none")]
 struct WebSocketTemplate;
 
+// ── Server.elm 生成相关 ──────────────────────────────────
+
+/// Server.elm 模板中每个方法的预计算数据
+struct ServerMethodData {
+    id: u16,
+    name: String,
+    param_module: String,
+    result_module: String,
+}
+
+#[derive(Template)]
+#[template(path = "server.j2", escape = "none")]
+struct ServerTemplate {
+    full_module_name: String,
+    interface_high: String,
+    interface_low: String,
+    methods: Vec<ServerMethodData>,
+    imports: Vec<String>,
+}
+
 // 渲染所有模块到自定义 OutputWriter
 pub fn render_elm_modules_to(
     context: &ElmContext,
@@ -74,6 +94,13 @@ pub fn render_elm_modules_to(
     if found_rpc {
         outputs.push(render_rpc_module()?);
         outputs.push(render_websocket_module()?);
+
+        // 为每个 interface 生成 Server.elm 子模块
+        for module in &context.modules {
+            if matches!(module.type_def, ElmTypeDef::Interface) {
+                outputs.push(render_server_module(module)?);
+            }
+        }
     }
 
     for (path, content) in outputs {
@@ -109,6 +136,63 @@ fn render_websocket_module() -> anyhow::Result<(PathBuf, String)> {
         .render()
         .expect("Failed to render WebSocket module");
     Ok((PathBuf::from("Rpc/WebSocket.elm"), content))
+}
+
+// 渲染 interface 的 Server.elm 子模块
+fn render_server_module(module: &ElmModule) -> anyhow::Result<(PathBuf, String)> {
+    let full_module_name = if module.path.is_empty() {
+        module.name.clone()
+    } else {
+        format!("{}.{}", module.path, module.name)
+    };
+
+    let high = format!("0x{:08X}", (module.id >> 32) as u32);
+    let low = format!("0x{:08X}", (module.id & 0xFFFFFFFF) as u32);
+
+    // 预计算每个方法的参数/结果模块路径
+    let methods: Vec<ServerMethodData> = module
+        .methods
+        .iter()
+        .map(|m| ServerMethodData {
+            id: m.id,
+            name: m.name.clone(),
+            param_module: m.param_type.module_name(),
+            result_module: m.result_type.module_name(),
+        })
+        .collect();
+
+    // 去重收集所有需要 import 的模块
+    let mut imports: Vec<String> = Vec::new();
+    for m in &methods {
+        if !m.param_module.is_empty() && !imports.contains(&m.param_module) {
+            imports.push(m.param_module.clone());
+        }
+        if !m.result_module.is_empty() && !imports.contains(&m.result_module) {
+            imports.push(m.result_module.clone());
+        }
+    }
+
+    let template = ServerTemplate {
+        full_module_name: full_module_name.clone(),
+        interface_high: high,
+        interface_low: low,
+        methods,
+        imports,
+    };
+
+    let content = template
+        .render()
+        .expect("Failed to render server module");
+
+    // 文件路径: FullModuleName/Server.elm
+    let file_path = full_module_name
+        .split('.')
+        .map(|s| s.to_upper_camel_case())
+        .collect::<Vec<_>>()
+        .join("/");
+    let file_name = format!("{}/Server.elm", file_path);
+
+    Ok((PathBuf::from(&file_name), content))
 }
 
 // 渲染单个模块

@@ -19,9 +19,11 @@ module Capnproto exposing
     , anyPointerToText
     , builderSegmentToBytes
     , bytesToHexdump
+    , capPointerOrNull
     , createBuilder
     , createReader
     , encodeAnyPointer
+    , encodeCapPointer
     , encodeDataPointer
     , encodeBoolList
     , encodeFloat32List
@@ -1288,6 +1290,31 @@ encodeNullPointer structOffset fieldOffset builder =
     builder
         |> writeUInt32AtOffset structOffset fieldOffset 0
         |> writeUInt32AtOffset structOffset (fieldOffset + 4) 0
+
+
+
+{-| Write a capability pointer referencing capTable[capIndex].
+Symmetric to readCapIndex: low 2 bits = 0b11 (capability kind),
+bits 2..31 = cap table index, upper 32 bits zero.
+-}
+encodeCapPointer : Int -> PointerEncoder
+encodeCapPointer capIndex structOffset fieldOffset builder =
+    builder
+        |> writeUInt32AtOffset structOffset fieldOffset (Bitwise.or (Bitwise.shiftLeftBy 2 capIndex) 0x3)
+        |> writeUInt32AtOffset structOffset (fieldOffset + 4) 0
+
+
+{-| Write a capability pointer when the field carries a real capability
+(Just capIndex), or a null pointer otherwise (Nothing).
+-}
+capPointerOrNull : Maybe Int -> PointerEncoder
+capPointerOrNull maybeCapIndex structOffset fieldOffset builder =
+    case maybeCapIndex of
+        Just capIndex ->
+            encodeCapPointer capIndex structOffset fieldOffset builder
+
+        Nothing ->
+            encodeNullPointer structOffset fieldOffset builder
 
 
 

@@ -1,12 +1,15 @@
 port module Rpc.Client exposing
     ( Capability(..)
     , RpcError(..)
+    , Reply
     , ReturnInfo
     , RpcState
     , ServerHandler
     , bootstrap
     , call
+    , capSlot
     , encodeRpcMessage
+    , export
     , handleIncomingCall
     , handleMessage
     , initState
@@ -91,7 +94,8 @@ type alias ReturnInfo =
    It receives:
      - methodId: which method of the interface is being called
      - contentReader: the Call payload content (encoded params)
-     - reply: a function that encodes results and sends a Return message
+     - reply: a Reply record (`send` / `sendRetainingCaps`) that encodes
+       results and sends a Return message
 
    Returns Ok msg on successful dispatch, or Err with an error description
    if decoding or dispatch fails (Rpc.Client will send an exception Return).
@@ -99,7 +103,21 @@ type alias ReturnInfo =
 -}
 
 type alias ServerHandler msg =
-    Int -> Capnproto.Reader -> (Capnproto.StructLayout -> Cmd msg) -> Result String msg
+    Int -> Capnproto.Reader -> List Capability -> Reply msg -> Result String msg
+
+
+{-| Reply functions handed to a ServerHandler.
+
+`send` answers the call and releases the parameter capabilities
+(releaseParamCaps = true, the default). `sendRetainingCaps` answers while
+keeping our references to the parameter capabilities (releaseParamCaps =
+false): use it when the handler stores a capability received in the params
+and will release it later via `releaseCapability`.
+-}
+type alias Reply msg =
+    { send : Capnproto.StructLayout -> Cmd msg
+    , sendRetainingCaps : Capnproto.StructLayout -> Cmd msg
+    }
 
 
 {- ==============================================================================
@@ -128,8 +146,10 @@ type alias ImportEntry =
     }
 
 
-type alias ExportEntry =
+type alias ExportEntry msg =
     { refCount : Int
+    , interfaceId : Capnproto.Word64
+    , handler : ServerHandler msg
     }
 
 
@@ -140,7 +160,7 @@ type alias RpcState msg =
     , questions : Dict Int (QuestionEntry msg)
     , answers : Dict Int AnswerEntry
     , importTable : Dict Int ImportEntry
-    , exportTable : Dict Int ExportEntry
+    , exportTable : Dict Int (ExportEntry msg)
     , serverHandlers : Dict ( Int, Int ) (ServerHandler msg)
     }
 
@@ -366,21 +386,55 @@ call :
     -> Capnproto.Word64
     -> Int
     -> Capnproto.StructLayout
+    -> List Capability
     -> (ReturnInfo -> msg)
     -> RpcState msg
     -> ( RpcState msg, Cmd msg )
-call target interfaceId methodId paramsLayout toMsg state =
+call target interfaceId methodId paramsLayout caps toMsg state =
     let
         questionId =
             state.nextQuestionId
 
+        -- Build the payload capTable from the parameter capabilities and
+        -- bump the export refcount for every SenderHosted descriptor sent.
+        -- Descriptor order MUST match the capTable indices written by the
+        -- params struct encoder (see `capSlot` / `encodeWithCaps`).
+        ( stateWithExports, capDescriptors ) =
+            List.foldl
+                (\cap ( st, descs ) ->
+                    case cap of
+                        ExportCap exportId ->
+                            ( { st
+                                | exportTable =
+                                    Dict.update exportId
+                                        (Maybe.map (\e -> { e | refCount = e.refCount + 1 }))
+                                        st.exportTable
+                              }
+                            , { attachedFd = 0, unnamedUnion = Rpc.CapDescriptor.SenderHosted exportId } :: descs
+                            )
+
+                        ImportCap importId ->
+                            ( st
+                            , { attachedFd = 0, unnamedUnion = Rpc.CapDescriptor.ReceiverHosted importId } :: descs
+                            )
+
+                        _ ->
+                            -- NullCap placeholder keeps the list aligned with
+                            -- the pointer slots; encoded as a `none` descriptor.
+                            ( st
+                            , { attachedFd = 0, unnamedUnion = Rpc.CapDescriptor.None } :: descs
+                            )
+                )
+                ( state, [] )
+                caps
+
         newState =
-            { state
+            { stateWithExports
                 | nextQuestionId = questionId + 1
                 , questions =
                     Dict.insert questionId
                         { callback = toMsg }
-                        state.questions
+                        stateWithExports.questions
             }
 
         messageTarget =
@@ -395,7 +449,7 @@ call target interfaceId methodId paramsLayout toMsg state =
 
         payload =
             { content = Capnproto.AnyPointerEncoder paramsEncoder
-            , capTable = []
+            , capTable = List.reverse capDescriptors
             }
 
         callMsg =
@@ -438,6 +492,58 @@ capabilityToMessageTarget cap =
 
         BrokenCap _ ->
             { unnamedUnion = Rpc.MessageTarget.ImportedCap 0 }
+
+
+{-| Resolve a struct capability field to its payload capTable slot.
+Real wire capabilities (ImportCap/ExportCap) occupy the statically assigned
+slot; anything else (null/pipeline/broken) is encoded as a null pointer.
+Used by the generated `encodeWithCaps` to keep pointer slots and capTable
+entries in lockstep.
+-}
+capSlot : Capability -> Int -> Maybe Int
+capSlot cap slot =
+    case cap of
+        ImportCap _ ->
+            Just slot
+
+        ExportCap _ ->
+            Just slot
+
+        _ ->
+            Nothing
+
+
+{-| Export a locally-implemented capability so it can be passed in call
+parameters (or returned to the peer). Allocates an export id, registers
+the handler in the export table, and returns the capability to embed in
+an entity field (via `encodeWithCaps`).
+
+The entry's refCount starts at 0 and grows by one for every SenderHosted
+descriptor actually sent; the peer's Release messages decrement it, and
+the entry (and handler) is dropped when it reaches zero.
+-}
+export :
+    Capnproto.Word64
+    -> ServerHandler msg
+    -> RpcState msg
+    -> ( Capability, RpcState msg )
+export interfaceId handler state =
+    let
+        exportId =
+            state.nextExportId
+    in
+    ( ExportCap exportId
+    , { state
+        | nextExportId = exportId + 1
+        , exportTable =
+            Dict.insert exportId
+                { refCount = 0
+                , interfaceId = interfaceId
+                , handler = handler
+                }
+                state.exportTable
+      }
+    )
 
 
 {- ==============================================================================
@@ -560,6 +666,11 @@ releaseCapability state cap =
    Registers a ServerHandler for a given interface. The handler will be called
    when an incoming Call targets the specified interface.
 
+   Deprecated: this registers one global handler per interface, so multiple
+   capability instances of the same interface cannot be distinguished. Prefer
+   `export`, which routes by the Call's MessageTarget (importedCap export id).
+   Kept as a fallback for peers that call without a real export id.
+
    The interfaceId is used to look up the handler. The key is (high, low) from
    the Word64, since Elm Dict requires comparable keys and records are not
    comparable.
@@ -594,8 +705,8 @@ registerServer interfaceId handler state =
    ==============================================================================
 -}
 
-sendReturn : Int -> Capnproto.StructLayout -> Cmd msg
-sendReturn answerId resultsLayout =
+sendReturnWith : Int -> Bool -> Capnproto.StructLayout -> Cmd msg
+sendReturnWith answerId releaseParamCaps resultsLayout =
     let
         resultsEncoder builder =
             let
@@ -611,7 +722,7 @@ sendReturn answerId resultsLayout =
 
         returnMsg =
             { answerId = answerId
-            , releaseParamCaps = True
+            , releaseParamCaps = releaseParamCaps
             , noFinishNeeded = False
             , unnamedUnion = Rpc.Return.Results payload
             }
@@ -623,6 +734,14 @@ sendReturn answerId resultsLayout =
             encodeRpcMessage message
     in
     sendBytes answerId messageBytes
+
+
+{-| Send a Return for an incoming Call, releasing the parameter capabilities
+(the default). See `sendReturnWith` for the retention variant.
+-}
+sendReturn : Int -> Capnproto.StructLayout -> Cmd msg
+sendReturn answerId resultsLayout =
+    sendReturnWith answerId True resultsLayout
 
 
 {- ==============================================================================
@@ -743,7 +862,10 @@ handleReturn state reader =
 
                         -- Process capTable from Return (Level 1)
                         ( stateWithCaps, capCmds, capTable ) =
-                            processReturnCapTable state returnReader
+                            returnReader
+                                |> Rpc.Return.getResultsReader
+                                |> Maybe.map (processPayloadCapTable state)
+                                |> Maybe.withDefault ( state, Cmd.none, [] )
 
                         -- Remove question from table
                         newState =
@@ -781,7 +903,7 @@ handleReturn state reader =
             ( state, Cmd.none, Nothing )
 
 
-{-| Process the capTable from a Return message's Payload.
+{-| Process the capTable from a message Payload (Call params or Return results).
 
    Reads each CapDescriptor, creates appropriate Capability values,
    and updates the import table with new entries.
@@ -796,45 +918,33 @@ handleReturn state reader =
      The transform navigates into the result struct (e.g., GetPointerField for field access).
      When used as a Call target, produces a PromisedAnswer message for promise pipelining.
 -}
-processReturnCapTable : RpcState msg -> Capnproto.Reader -> ( RpcState msg, Cmd msg, List Capability )
-processReturnCapTable state returnReader =
-    let
-        maybePayloadReader =
-            Rpc.Return.getResultsReader returnReader
-    in
-    case maybePayloadReader of
-        Just payloadReader ->
-            let
-                maybeCapCount =
-                    Rpc.Payload.getCapTableCount payloadReader
-            in
-            case maybeCapCount of
-                Just count ->
-                    if count == 0 then
-                        ( state, Cmd.none, [] )
-                    else
-                        let
-                            ( finalState, finalCmds, caps ) =
-                                List.foldl
-                                    (\index ( st, cmds, capList ) ->
-                                        case Rpc.Payload.getCapTableAt payloadReader index of
-                                            Just capDesc ->
-                                                let
-                                                    ( newState, newCmds, cap ) =
-                                                        processCapDescriptor st capDesc
-                                                in
-                                                ( newState, Cmd.batch [ cmds, newCmds ], cap :: capList )
+processPayloadCapTable : RpcState msg -> Capnproto.Reader -> ( RpcState msg, Cmd msg, List Capability )
+processPayloadCapTable state payloadReader =
+    case Rpc.Payload.getCapTableCount payloadReader of
+        Just count ->
+            if count == 0 then
+                ( state, Cmd.none, [] )
 
-                                            Nothing ->
-                                                ( st, cmds, capList )
-                                    )
-                                    ( state, Cmd.none, [] )
-                                    (List.range 0 (count - 1))
-                        in
-                        ( finalState, finalCmds, List.reverse caps )
+            else
+                let
+                    ( finalState, finalCmds, caps ) =
+                        List.foldl
+                            (\index ( st, cmds, capList ) ->
+                                case Rpc.Payload.getCapTableAt payloadReader index of
+                                    Just capDesc ->
+                                        let
+                                            ( newState, newCmds, cap ) =
+                                                processCapDescriptor st capDesc
+                                        in
+                                        ( newState, Cmd.batch [ cmds, newCmds ], cap :: capList )
 
-                Nothing ->
-                    ( state, Cmd.none, [] )
+                                    Nothing ->
+                                        ( st, cmds, capList )
+                            )
+                            ( state, Cmd.none, [] )
+                            (List.range 0 (count - 1))
+                in
+                ( finalState, finalCmds, List.reverse caps )
 
         Nothing ->
             ( state, Cmd.none, [] )
@@ -929,7 +1039,28 @@ handleIncomingCall state reader =
                         Just interfaceId ->
                             case ( Rpc.Call.getMethodId callReader, extractParamsReader callReader ) of
                                 ( Just methodId, Just paramsReader ) ->
-                                    dispatchToHandler state questionId interfaceId methodId paramsReader
+                                    let
+                                        maybeTargetUnion =
+                                            Rpc.Call.getTarget callReader
+                                                |> Maybe.map (\target -> target.unnamedUnion)
+
+                                        -- Resolve the Call payload's capTable into
+                                        -- Capability values for the handler (params
+                                        -- structs with capability fields decode
+                                        -- against this list).
+                                        ( stateWithCaps, capCmds, paramCaps ) =
+                                            case Rpc.Call.getParamsReader callReader of
+                                                Just payloadReader ->
+                                                    processPayloadCapTable state payloadReader
+
+                                                Nothing ->
+                                                    ( state, Cmd.none, [] )
+                                    in
+                                    case
+                                        dispatchToHandler stateWithCaps questionId interfaceId methodId paramsReader paramCaps maybeTargetUnion
+                                    of
+                                        ( dState, dCmd, dMsg ) ->
+                                            ( dState, Cmd.batch [ capCmds, dCmd ], dMsg )
 
                                 _ ->
                                     ( state, Cmd.none, Nothing )
@@ -953,7 +1084,16 @@ extractParamsReader callReader =
         |> Maybe.andThen Rpc.Payload.getContentReader
 
 
-{-| Dispatch an incoming Call to the registered handler.
+{-| Dispatch an incoming Call to a handler.
+
+Resolution order:
+1. target = importedCap(exportId) with a live export table entry: use that
+   instance's handler (multi-instance routing). Interface id mismatch is a
+   protocol error and answers with an exception.
+2. Fall back to the interface-keyed `registerServer` table (deprecated;
+   kept for peers that call without a real export id, e.g. bootstrap-style
+   targets from the test backend).
+3. Neither: exception Return.
 -}
 dispatchToHandler :
     RpcState msg
@@ -961,8 +1101,10 @@ dispatchToHandler :
     -> Capnproto.Word64
     -> Int
     -> Capnproto.Reader
+    -> List Capability
+    -> Maybe Rpc.MessageTarget.Union
     -> ( RpcState msg, Cmd msg, Maybe msg )
-dispatchToHandler state questionId interfaceId methodId paramsReader =
+dispatchToHandler state questionId interfaceId methodId paramsReader paramCaps maybeTargetUnion =
     let
         handlerKey =
             ( interfaceId.high, interfaceId.low )
@@ -975,34 +1117,63 @@ dispatchToHandler state questionId interfaceId methodId paramsReader =
                         { questionId = questionId }
                         state.answers
             }
-    in
-    case Dict.get handlerKey state.serverHandlers of
-        Just handler ->
-            -- Build reply function: encodes results and sends Return
-            let
-                replyFn resultsLayout =
-                    sendReturn questionId resultsLayout
-            in
-            case handler methodId paramsReader replyFn of
+
+        maybeExportEntry =
+            maybeTargetUnion
+                |> Maybe.andThen
+                    (\tu ->
+                        case tu of
+                            Rpc.MessageTarget.ImportedCap exportId ->
+                                Dict.get exportId newState.exportTable
+
+                            _ ->
+                                Nothing
+                    )
+
+        replyFn =
+            { send = sendReturn questionId
+            , sendRetainingCaps = sendReturnWith questionId False
+            }
+
+        runHandler handler =
+            case handler methodId paramsReader paramCaps replyFn of
                 Ok appMsg ->
                     ( newState, Cmd.none, Just appMsg )
 
                 Err errMsg ->
-                    -- Handler dispatch failed (decode error, unknown method, etc.)
                     ( newState, sendExceptionReturn questionId errMsg, Nothing )
+    in
+    case maybeExportEntry of
+        Just entry ->
+            if entry.interfaceId == interfaceId then
+                runHandler entry.handler
+
+            else
+                ( newState
+                , sendExceptionReturn questionId
+                    ("Call target export does not implement interface: "
+                        ++ String.fromInt interfaceId.high
+                        ++ ":"
+                        ++ String.fromInt interfaceId.low
+                    )
+                , Nothing
+                )
 
         Nothing ->
-            -- No handler registered for this interface
-            let
-                errCmd =
-                    sendExceptionReturn questionId
+            case Dict.get handlerKey newState.serverHandlers of
+                Just handler ->
+                    runHandler handler
+
+                Nothing ->
+                    ( newState
+                    , sendExceptionReturn questionId
                         ("No handler registered for interface: "
                             ++ String.fromInt interfaceId.high
                             ++ ":"
                             ++ String.fromInt interfaceId.low
                         )
-            in
-            ( newState, errCmd, Nothing )
+                    , Nothing
+                    )
 
 
 {-| Handle a Resolve message (Level 1).
@@ -1147,7 +1318,7 @@ handleReleaseMessage state reader =
                             if newCount <= 0 then
                                 Dict.remove exportId state.exportTable
                             else
-                                Dict.insert exportId { refCount = newCount } state.exportTable
+                                Dict.insert exportId { entry | refCount = newCount } state.exportTable
 
                         Nothing ->
                             state.exportTable

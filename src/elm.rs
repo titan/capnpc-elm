@@ -499,6 +499,10 @@ pub struct ElmField {
     pub offset: u32,              // Offset for data fields
     pub is_union_container: bool, // Whether this field is a union container
     pub default_value: Option<ElmDefaultValue>,
+    /// Payload capTable slot for interface fields: the index of this field's
+    /// capability in the list returned by `encodeWithCaps`. `None` for
+    /// non-capability fields.
+    pub cap_slot: Option<usize>,
 }
 
 #[derive(Debug, Clone)]

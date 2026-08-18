@@ -63,6 +63,7 @@ struct ServerMethodData {
     name: String,
     param_module: String,
     result_module: String,
+    param_has_caps: bool,
 }
 
 #[derive(Template)]
@@ -158,6 +159,7 @@ fn render_server_module(module: &ElmModule) -> anyhow::Result<(PathBuf, String)>
             name: m.name.clone(),
             param_module: m.param_type.module_name(),
             result_module: m.result_type.module_name(),
+            param_has_caps: m.param_has_caps,
         })
         .collect();
 
@@ -199,10 +201,14 @@ fn render_server_module(module: &ElmModule) -> anyhow::Result<(PathBuf, String)>
 fn render_module(module: &ElmModule) -> anyhow::Result<(PathBuf, String)> {
     // 准备模块数据
     let full_module_name = format!("{}.{}", module.path, module.name);
-    let exports = generate_exports(module);
+    let has_interface_fields = module
+        .fields
+        .iter()
+        .any(|f| f.elm_type.contains_interface_ref());
+    let exports = generate_exports(module, has_interface_fields);
 
     let body = match module.type_def {
-        ElmTypeDef::Struct => render_struct(module).unwrap_or_else(|e| {
+        ElmTypeDef::Struct => render_struct(module, has_interface_fields).unwrap_or_else(|e| {
             eprintln!("Failed to render struct: {}", e);
             String::new()
         }),
@@ -280,7 +286,7 @@ fn extract_enum_variants(fields: &[ElmField]) -> Vec<ElmEnumVariant> {
 }
 
 // 生成导出列表
-fn generate_exports(module: &ElmModule) -> Vec<String> {
+fn generate_exports(module: &ElmModule, has_interface_fields: bool) -> Vec<String> {
     let mut exports = vec![];
 
     match module.type_def {
@@ -289,6 +295,9 @@ fn generate_exports(module: &ElmModule) -> Vec<String> {
             exports.push("dataWords".to_string());
             exports.push("pointerWords".to_string());
             exports.push("encode".to_string());
+            if has_interface_fields {
+                exports.push("encodeWithCaps".to_string());
+            }
             exports.push("decode".to_string());
             exports.push("toAnyPointer".to_string());
             exports.push("fromAnyPointer".to_string());
@@ -346,7 +355,7 @@ fn generate_exports(module: &ElmModule) -> Vec<String> {
     exports
 }
 
-fn render_struct(module: &ElmModule) -> askama::Result<String> {
+fn render_struct(module: &ElmModule, has_interface_fields: bool) -> askama::Result<String> {
     let mut data_fields = Vec::new();
     let mut pointer_fields = Vec::new();
     let mut has_union = false;
@@ -407,11 +416,6 @@ fn render_struct(module: &ElmModule) -> askama::Result<String> {
             }
         }
     }
-
-    let has_interface_fields = module
-        .fields
-        .iter()
-        .any(|f| f.elm_type.contains_interface_ref());
 
     // 创建结构体模板
     let struct_template = StructTemplate {

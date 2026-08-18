@@ -313,7 +313,8 @@ impl<'a> TypeMappingContext<'a> {
     }
 
     /// Check if a struct type's fields contain any InterfaceRef (capability).
-    pub fn result_struct_has_interface_fields(&self, capnp_type: &Type) -> bool {
+    /// Works for method param structs as well as result structs.
+    pub fn struct_type_has_interface_fields(&self, capnp_type: &Type) -> bool {
         let node_id = match capnp_type {
             Type::StructRef(id, _) => *id,
             _ => return false,

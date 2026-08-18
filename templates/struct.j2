@@ -25,12 +25,17 @@ pointerWords : Int
 pointerWords =
     {{ module.pointer_words }}
 
+{% if has_interface_fields %}{# 含 capability 字段：encode 写 null 指针保持旧语义；encodeWithCaps 产出 (layout, capTable 列表)，指针槽与列表下标按 interface 字段序静态对齐 #}
+layout : {% if !generic_params.is_empty() %}{% for param in generic_params %}({{ param }} -> Capnproto.AnyPointer) -> {% endfor %}{% endif %}(Rpc.Capability -> Int -> Maybe Int) -> Entity {% for param in generic_params %}{{ param }} {% endfor %}-> Capnproto.StructLayout
+layout {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ param }}Encoder {% endfor %}{% endif %}resolveCaps entity =
+{% else %}
 {% if !generic_params.is_empty() %}{# 有泛型参数 #}
 encode : {% for param in generic_params %}({{ param }} -> Capnproto.AnyPointer) -> {% endfor %}Entity {% for param in generic_params %}{{ param }} {% endfor %}-> Capnproto.StructLayout
 {% else %}
 encode : Entity -> Capnproto.StructLayout
 {% endif %}
 encode {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ param }}Encoder {% endfor %}{% endif %}entity =
+{% endif %}
     { dataEncoders =
         [
             {% if has_union %}{# 有 Union 类型 #}
@@ -156,7 +161,7 @@ encode {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ pa
                     builder
                 {% else if field.elm_type|is_interface_ref %}
             \soffset ptrOffset builder ->
-                Capnproto.encodeNullPointer soffset ptrOffset builder
+                Capnproto.capPointerOrNull (resolveCaps entity.{{ field.name|escape_elm_keyword }} {{ field.cap_slot.unwrap_or(0) }}) soffset ptrOffset builder
                 {% else if field.elm_type|is_anypointer_type %}
             \soffset ptrOffset builder ->
                 Capnproto.encodeAnyPointer entity.{{ field.name|escape_elm_keyword }} soffset ptrOffset builder
@@ -243,6 +248,39 @@ encode {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ pa
     , dataWords = dataWords
     , pointerWords = pointerWords
     }
+{% if has_interface_fields %}
+
+{- Legacy encoder: capability fields are written as null pointers.
+Use `encodeWithCaps` to carry real capabilities in an RPC payload.
+-}
+{% if !generic_params.is_empty() %}{# 有泛型参数 #}
+encode : {% for param in generic_params %}({{ param }} -> Capnproto.AnyPointer) -> {% endfor %}Entity {% for param in generic_params %}{{ param }} {% endfor %}-> Capnproto.StructLayout
+{% else %}
+encode : Entity -> Capnproto.StructLayout
+{% endif %}
+encode {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ param }}Encoder {% endfor %}{% endif %}entity =
+    layout {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ param }}Encoder {% endfor %}{% endif %}(\_ _ -> Nothing) entity
+
+
+{- Capability-aware encoder: encodes capability fields as payload capTable
+pointers and returns the capabilities in the same order, so the caller can
+hand them to `Rpc.call` as the payload capTable. Slot order matches the
+capability pointer indices (see `Rpc.capSlot`). Null/pipeline/broken
+capabilities are encoded as null pointers.
+
+Limitations: capabilities nested inside struct fields, list elements or
+union branches are still written as null pointers this phase.
+-}
+{% if !generic_params.is_empty() %}{# 有泛型参数 #}
+encodeWithCaps : {% for param in generic_params %}({{ param }} -> Capnproto.AnyPointer) -> {% endfor %}Entity {% for param in generic_params %}{{ param }} {% endfor %}-> ( Capnproto.StructLayout, List Rpc.Capability )
+{% else %}
+encodeWithCaps : Entity -> ( Capnproto.StructLayout, List Rpc.Capability )
+{% endif %}
+encodeWithCaps {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ param }}Encoder {% endfor %}{% endif %}entity =
+    ( layout {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ param }}Encoder {% endfor %}{% endif %}Rpc.capSlot entity
+    , {% for field in fields %}{% if field.cap_slot.is_some() %}entity.{{ field.name|escape_elm_keyword }} :: {% endif %}{% endfor %}[]
+    )
+{% endif %}
 
 {% if has_union %}
 getWhich : Capnproto.Reader -> Maybe Int

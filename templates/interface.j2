@@ -12,8 +12,13 @@ interfaceId =
 {{ method.name }} target state
     {% for param in method.implicit_parameters %}{{ param }} {% endfor %}params toMsg =
     let
+        {% if method.param_has_caps %}
+        ( paramsLayout, paramCaps ) =
+            {{ method.param_type|elm_type_module_str }}.encodeWithCaps params
+        {% else %}
         paramsLayout =
             {{ method.param_type|elm_type_module_str }}.encode params
+        {% endif %}
 
         decoder : Rpc.ReturnInfo -> msg
         decoder returnInfo =
@@ -31,5 +36,5 @@ interfaceId =
                         Err err
                 )
     in
-    Rpc.call target interfaceId {{ method.id }} paramsLayout decoder state
+    Rpc.call target interfaceId {{ method.id }} paramsLayout {% if method.param_has_caps %}paramCaps{% else %}[]{% endif %} decoder state
 {% endfor %}

@@ -81,12 +81,16 @@ fn convert_node_to_elm(node: &Node, context: &mut ElmContext, ctx: &mut TypeMapp
 
             TypeMappingContext::collect_imports_from_type(&param_type, &mut imports);
             TypeMappingContext::collect_imports_from_type(&result_type, &mut imports);
-            let param_has_caps = param_type.contains_interface_ref();
-            // result_type 是 StructRef 时，contains_interface_ref() 只检查泛型参数
-            // 但结果 struct 的字段（如 EchoFactory.create → CreateResults.echo）可能含 interface
+            // param_has_caps 必须与 struct 模块会生成 encodeWithCaps 的判定一致
+            // （即参数 struct 的字段含 interface），否则生成的调用会指向不存在的函数。
+            // 注意不要用 param_type.contains_interface_ref()：泛型参数含 interface 时
+            // 参数 struct 模块本身并不生成 encodeWithCaps。
+            let param_has_caps = ctx.struct_type_has_interface_fields(&method.param_type);
+            // param/result_type 是 StructRef 时，contains_interface_ref() 只检查泛型参数
+            // 但 struct 的字段（如 EchoFactory.create → CreateResults.echo）可能含 interface
             // 需要额外查看对应 struct node 的 fields
             let result_has_caps = result_type.contains_interface_ref()
-                || ctx.result_struct_has_interface_fields(&method.result_type);
+                || ctx.struct_type_has_interface_fields(&method.result_type);
 
             elm_methods.push(ElmMethod {
                 id: method.id,
@@ -170,6 +174,7 @@ fn convert_node_to_elm(node: &Node, context: &mut ElmContext, ctx: &mut TypeMapp
                     offset: discriminant_offset,
                     is_union_container: true,
                     default_value: None,
+                    cap_slot: None,
                 };
 
                 TypeMappingContext::collect_imports_from_type(
@@ -212,6 +217,7 @@ fn convert_node_to_elm(node: &Node, context: &mut ElmContext, ctx: &mut TypeMapp
                             offset: *offset,
                             is_union_container: true,
                             default_value: None,
+                            cap_slot: None,
                         };
 
                         TypeMappingContext::collect_imports_from_type(
@@ -278,6 +284,8 @@ fn convert_fields(
     ctx: &mut TypeMappingContext,
     current_node_id: u64,
 ) {
+    // capability 字段按声明顺序分配 payload capTable 槽位
+    let mut next_cap_slot = 0;
     for field in capnp_fields {
         if let Type::StructRef(id, _) = field.typ {
             if ctx.is_group_struct(id) {
@@ -288,6 +296,13 @@ fn convert_fields(
         let elm_type = ctx.map_type(&field.typ, current_node_id);
         TypeMappingContext::collect_imports_from_type(&elm_type, imports);
         let is_union_container = matches!(elm_type, ElmType::UnionInline(..));
+        let cap_slot = if elm_type.is_interface_ref() {
+            let slot = next_cap_slot;
+            next_cap_slot += 1;
+            Some(slot)
+        } else {
+            None
+        };
 
         fields.push(ElmField {
             name: field.name.clone(),
@@ -296,6 +311,7 @@ fn convert_fields(
             offset: field.offset,
             is_union_container,
             default_value: TypeMappingContext::map_default_value(&field.default_value),
+            cap_slot,
         });
     }
 }
@@ -326,5 +342,6 @@ fn convert_enum_to_fields(
         offset: 0,
         is_union_container: false,
         default_value: None,
+        cap_slot: None,
     });
 }

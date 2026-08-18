@@ -26,13 +26,13 @@ interfaceId =
 
 
 makeDispatcher : Handlers msg -> Rpc.ServerHandler msg
-makeDispatcher handlers methodId payloadReader replyFn =
+makeDispatcher handlers methodId payloadReader caps replyFn =
     case methodId of
 {% for method in methods %}
         {{ method.id }} ->
-            case {{ method.param_module }}.decode payloadReader of
+            case {{ method.param_module }}.decode {% if method.param_has_caps %}caps {% endif %}payloadReader of
                 Ok params ->
-                    Ok (handlers.{{ method.name }} params (\results -> replyFn ({{ method.result_module }}.encode results)))
+                    Ok (handlers.{{ method.name }} params (\results -> replyFn.send ({{ method.result_module }}.encode results)))
 
                 Err err ->
                     Err ("Failed to decode params for {{ method.name }}: " ++ err)
@@ -40,3 +40,14 @@ makeDispatcher handlers methodId payloadReader replyFn =
 {% endfor %}
         _ ->
             Err ("Unknown method: " ++ String.fromInt methodId)
+
+
+
+{- Default dispatcher: answers with `replyFn.send` (releaseParamCaps = true,
+i.e. parameter capabilities are released when the Return is sent).
+
+A handler that KEEPS a parameter capability (e.g. stores a listener for later
+calls) must answer with `replyFn.sendRetainingCaps` and release the reference
+later via `Rpc.releaseCapability`. `makeDispatcher` cannot express that —
+write a custom `Rpc.ServerHandler` (combine it with `Rpc.export`) instead.
+-}

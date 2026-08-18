@@ -736,9 +736,18 @@ handleReturn state reader =
                         newState =
                             { stateWithCaps | questions = Dict.remove answerId stateWithCaps.questions }
 
-                        -- Encode Finish to release server resources
+                        -- Encode Finish to release server resources.
+                        -- If the Return carried capabilities that we imported
+                        -- (non-empty capTable), we RETAIN them: the server must
+                        -- keep its exports alive, so releaseResultCaps must be
+                        -- false. Releasing here would drop the export refcount
+                        -- to zero on conformant servers (e.g. capnp-rust) and
+                        -- every later call on the capability would fail with
+                        -- "Message target is not a current export ID".
+                        -- Retained caps are released later via Release
+                        -- messages (see releaseCapability).
                         finishCmd =
-                            sendFinish answerId True
+                            sendFinish answerId (List.isEmpty capTable)
 
                         -- Build ReturnInfo
                         returnInfo =

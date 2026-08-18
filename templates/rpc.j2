@@ -51,6 +51,7 @@ type RpcError
     | TransportError String
     | CapnpError String
     | TimeoutError String
+    | RemoteError String
 
 
 {- ==============================================================================
@@ -722,11 +723,23 @@ handleReturn state reader =
                 Just questionEntry ->
                     let
                         -- Extract payload content from Return
+                        -- An exception Return carries the failure reason in
+                        -- the message itself (rpc.capnp Return.exception):
+                        -- surface it as RemoteError instead of a generic
+                        -- "failed to extract payload" decoding error, so
+                        -- callers can show the server's reason text.
                         contentResult =
-                            returnReader
-                                |> Rpc.Return.getResultsReader
-                                |> Maybe.andThen Rpc.Payload.getContentReader
-                                |> Result.fromMaybe (DecodingError "Failed to extract Return payload")
+                            if Rpc.Return.isException returnReader then
+                                returnReader
+                                    |> Rpc.Return.getException
+                                    |> Maybe.map (.reason >> RemoteError >> Err)
+                                    |> Maybe.withDefault (Err (RemoteError "unknown remote exception"))
+
+                            else
+                                returnReader
+                                    |> Rpc.Return.getResultsReader
+                                    |> Maybe.andThen Rpc.Payload.getContentReader
+                                    |> Result.fromMaybe (DecodingError "Failed to extract Return payload")
 
                         -- Process capTable from Return (Level 1)
                         ( stateWithCaps, capCmds, capTable ) =

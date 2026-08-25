@@ -222,7 +222,14 @@ export function createWebSocketManager(ports, options = {}) {
     }
 
     /**
-     * Deliver a complete message to Elm
+     * Deliver a complete message to Elm — raw passthrough.
+     *
+     * processBinaryMessage() has ALREADY stripped the length prefix (it
+     * reassembles [len][msg] frames that may split across WS messages).
+     * Rpc/WebSocket.receive must NOT re-apply unframeMessage: stripping
+     * the prefix twice misreads the capnp segment-count word as a frame
+     * length and corrupts every inbound message. Framing stays symmetric:
+     * applied once on send (Elm), stripped once on receive (JS).
      * @param {Uint8Array} messageData - Complete message data
      */
     function deliverMessage(messageData) {

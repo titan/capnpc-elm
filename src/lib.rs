@@ -10,6 +10,9 @@ mod output;
 mod render;
 mod type_mapping;
 
+#[cfg(test)]
+mod tests;
+
 /// Search standard system include paths for capnp/rpc.capnp
 fn find_rpc_schema() -> Option<PathBuf> {
     let candidates = [

@@ -91,6 +91,27 @@ templates/
   module.j2        Common module header
 ```
 
+## Wire Protocol
+
+The generated RPC runtime speaks Cap'n Proto RPC over WebSocket binary frames with a length-prefix framing layer:
+
+```
+[ length: u32 little-endian ][ message bytes (length bytes) ]
+```
+
+- `message bytes` is one Cap'n Proto RPC message in the standard (unpacked) serialization format — the same bytes `capnp::serialize::write_message` produces. The packed encoding is not used.
+- The length prefix counts payload bytes only (excluding the 4 prefix bytes).
+- WebSocket frames are **not** a message boundary: one WS binary frame may batch several messages or carry a partial one. Receivers must reassemble strictly by the length prefix.
+- Senders emit exactly one framed message per WS binary frame.
+
+Three independent implementations depend on this framing; treat it as a compatibility contract:
+
+| Implementation | Path |
+|---|---|
+| Browser JS port layer (Elm ports) | `src/js/websocket.js` |
+| TypeScript test backend | `test-project/backend/src/services.ts` (`sendFrame` / `processBuffer`) |
+| Rust WS↔stream bridge (for capnp-rpc peers) | `test-project/rust-interop/src/bridge.rs` |
+
 ## Testing
 
 There are currently no Rust unit tests. `cargo test` compiles but does not execute any tests.

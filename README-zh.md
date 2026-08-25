@@ -91,6 +91,27 @@ templates/
   module.j2        通用模块头
 ```
 
+## 线路协议
+
+生成的 RPC 运行时通过 WebSocket 二进制帧承载 Cap'n Proto RPC，外层为长度前缀分帧：
+
+```
+[ length: u32 小端 ][ 消息字节 (length 字节) ]
+```
+
+- 消息字节是一条 Cap'n Proto RPC 消息的标准（非 packed）序列化格式 —— 与 `capnp::serialize::write_message` 产出的字节相同，不使用 packed 编码。
+- 长度前缀只计负载字节数（不含 4 字节前缀本身）。
+- WebSocket 帧**不是**消息边界：一个 WS 二进制帧可能批量携带多条消息，也可能只含某条消息的一部分。接收方必须严格按长度前缀重组。
+- 发送方每条消息恰好发一个 WS 二进制帧。
+
+三个独立实现依赖此分帧格式，将其视为兼容性契约：
+
+| 实现 | 路径 |
+|---|---|
+| 浏览器 JS 端口层（Elm ports） | `src/js/websocket.js` |
+| TypeScript 测试后端 | `test-project/backend/src/services.ts`（`sendFrame` / `processBuffer`） |
+| Rust WS↔流桥（对接 capnp-rpc） | `test-project/rust-interop/src/bridge.rs` |
+
 ## 测试
 
 当前无 Rust 单元测试。`cargo test` 可编译但不会执行测试。

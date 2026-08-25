@@ -19,7 +19,6 @@ port module Rpc.WebSocket exposing
     , receive
     , send
     , subscriptions
-    , unframeMessage
     )
 
 import Bitwise
@@ -135,9 +134,8 @@ send conn data =
 
 Raw passthrough: the JS side of the transport has already stripped the
 length prefix (it reassembles [len][msg] frames that may split across
-WS messages). Applying unframeMessage here would strip a second prefix —
-the capnp segment-count word would be misread as a frame length,
-corrupting every inbound message.
+WS messages). Stripping a prefix again here would misread the capnp
+segment-count word as a frame length, corrupting every inbound message.
 -}
 receive : { data : List Int } -> Result String Bytes
 receive { data } =
@@ -206,46 +204,6 @@ frameMessage messageData =
                 ]
     in
     BE.encode frameEncoder
-
-
-{-| Unframe a length-prefixed message
-
-Returns the message data without the length prefix.
-
--}
-unframeMessage : Bytes -> Result String Bytes
-unframeMessage framedData =
-    let
-        totalLength =
-            Bytes.width framedData
-    in
-    if totalLength < 4 then
-        Err "Frame too short for length prefix"
-
-    else
-        let
-            lengthDecoder =
-                BD.unsignedInt32 Bytes.LE
-
-            dataDecoder length =
-                BD.bytes 4
-                    |> BD.andThen (\_ -> BD.bytes length)
-        in
-        case BD.decode lengthDecoder framedData of
-            Just messageLength ->
-                if totalLength < 4 + messageLength then
-                    Err ("Frame incomplete: expected " ++ String.fromInt (4 + messageLength) ++ " bytes, got " ++ String.fromInt totalLength)
-
-                else
-                    case BD.decode (dataDecoder messageLength) framedData of
-                        Just messageData ->
-                            Ok messageData
-
-                        Nothing ->
-                            Err "Failed to decode message data"
-
-            Nothing ->
-                Err "Failed to decode frame length"
 
 
 

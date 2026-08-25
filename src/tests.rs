@@ -332,8 +332,8 @@ fn websocket_receive_is_raw_passthrough() {
         "receive must pass bytes through raw:\n{ws}"
     );
     assert!(
-        !ws.contains("Result.andThen unframeMessage"),
-        "receive must NOT strip a second length prefix:\n{ws}"
+        !ws.contains("unframeMessage"),
+        "unframeMessage is dead code (JS strips the prefix); module must not mention it:\n{ws}"
     );
     assert!(
         ws.contains("frameMessage"),

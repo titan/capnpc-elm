@@ -12,7 +12,6 @@
 port module Rpc.WebSocket exposing
     ( Connection
     , ConnectionState(..)
-    , Frame
     , connect
     , disconnect
     , frameMessage
@@ -41,14 +40,6 @@ type ConnectionState
 type alias Connection =
     { url : String
     , state : ConnectionState
-    }
-
-
-{-| Frame structure for length-prefixed messages
--}
-type alias Frame =
-    { length : Int
-    , data : Bytes
     }
 
 

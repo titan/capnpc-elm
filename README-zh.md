@@ -114,7 +114,7 @@ templates/
 
 ## 测试
 
-当前无 Rust 单元测试。`cargo test` 可编译但不会执行测试。
+单测在 `src/tests.rs`，用 `cargo test` 运行——或 `./verify.sh`（test-project 在盘时附加全量 E2E，`--fast` 跳过）。
 
 测试生成输出的推荐方式：调用 `render_elm_to()` + `MemoryWriter`（`output.rs`），收集渲染结果到内存 HashMap 而不写文件、不调 elm-format。
 

@@ -114,7 +114,7 @@ Three independent implementations depend on this framing; treat it as a compatib
 
 ## Testing
 
-There are currently no Rust unit tests. `cargo test` compiles but does not execute any tests.
+Unit tests live in `src/tests.rs` and run with `cargo test` — or `./verify.sh`, which additionally runs the full E2E when `test-project/` is present (`--fast` skips E2E).
 
 The recommended way to test generated output is to call `render_elm_to()` with `MemoryWriter` (`output.rs`), which collects rendered results into an in-memory HashMap without writing files or calling elm-format.
 

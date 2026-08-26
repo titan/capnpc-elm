@@ -15,9 +15,7 @@ capnp compile -oelm:<output-dir> <schema.capnp> --src-prefix=<prefix>
 
 ## 测试
 
-**当前无 Rust 单元测试**（`src/` 中无 `#[test]`）。`cargo test` 可编译但不会执行测试。
-
-测试生成输出的推荐方式：使用 `render_elm_to()` + `MemoryWriter`（`output.rs`），它收集渲染结果到内存 HashMap 而不写文件、不调 elm-format。
+单测在 `src/tests.rs`（7 个，经 `render_elm_to()` + `MemoryWriter` 走 parse/bind/render 管线，不写文件、不调 elm-format）。`./verify.sh` = cargo test + 全量 E2E（test-project 在盘时）；`./verify.sh --fast` 只跑单测。
 
 集成验证在 `test-project/`（gitignored）中进行：schema → 代码生成 → Elm 编译 → WebSocket RPC → E2E 测试。
 

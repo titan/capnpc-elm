@@ -260,6 +260,71 @@ impl ElmType {
         }
     }
 
+    /// 跨模块引用的 decode 函数名（含模块限定）。
+    /// 合并次成员的实体名带前缀（PropEntity），据此推导 propDecode。
+    pub fn qualified_decode_fn(&self) -> String {
+        match self {
+            ElmType::StructRef(m, e, _) => {
+                let (prefix, _) = split_prefixed_entity(e);
+                let f = if prefix.is_empty() {
+                    "decode".to_owned()
+                } else {
+                    format!("{}Decode", prefix)
+                };
+                if m.is_empty() { f } else { format!("{}.{}", m, f) }
+            }
+            _ => "decode".to_owned(),
+        }
+    }
+
+    /// 跨模块引用的 encode 函数名（含模块限定），同 qualified_decode_fn。
+    pub fn qualified_encode_fn(&self) -> String {
+        match self {
+            ElmType::StructRef(m, e, _) => {
+                let (prefix, _) = split_prefixed_entity(e);
+                let f = if prefix.is_empty() {
+                    "encode".to_owned()
+                } else {
+                    format!("{}Encode", prefix)
+                };
+                if m.is_empty() { f } else { format!("{}.{}", m, f) }
+            }
+            _ => "encode".to_owned(),
+        }
+    }
+
+    /// 跨模块引用的 dataWords 常量名（含模块限定）。
+    pub fn qualified_data_words(&self) -> String {
+        match self {
+            ElmType::StructRef(m, e, _) => {
+                let (prefix, _) = split_prefixed_entity(e);
+                let f = if prefix.is_empty() {
+                    "dataWords".to_owned()
+                } else {
+                    format!("{}DataWords", prefix)
+                };
+                if m.is_empty() { f } else { format!("{}.{}", m, f) }
+            }
+            _ => "dataWords".to_owned(),
+        }
+    }
+
+    /// 跨模块引用的 pointerWords 常量名（含模块限定）。
+    pub fn qualified_pointer_words(&self) -> String {
+        match self {
+            ElmType::StructRef(m, e, _) => {
+                let (prefix, _) = split_prefixed_entity(e);
+                let f = if prefix.is_empty() {
+                    "pointerWords".to_owned()
+                } else {
+                    format!("{}PointerWords", prefix)
+                };
+                if m.is_empty() { f } else { format!("{}.{}", m, f) }
+            }
+            _ => "pointerWords".to_owned(),
+        }
+    }
+
     /// 返回所属模块名（用于 import 和限定引用）
     pub fn module_name(&self) -> String {
         match self {
@@ -401,14 +466,14 @@ impl ElmType {
                 ElmType::Primitive(ElmPrimitiveType::String) => {
                     "Capnproto.encodeTextList".to_string()
                 }
-                ElmType::StructRef(module_name, _, _) => {
-                    if module_name.is_empty() {
-                        "Capnproto.encodeStructList encode dataWords pointerWords".to_string()
+                ElmType::StructRef(_, _, _) => {
+                    let enc = inner.qualified_encode_fn();
+                    let dw = inner.qualified_data_words();
+                    let pw = inner.qualified_pointer_words();
+                    if enc.contains('.') {
+                        format!("Capnproto.encodeStructList {enc} {dw} {pw}")
                     } else {
-                        format!(
-                            "Capnproto.encodeStructList {}.encode {}.dataWords {}.pointerWords",
-                            module_name, module_name, module_name
-                        )
+                        "Capnproto.encodeStructList encode dataWords pointerWords".to_string()
                     }
                 }
                 // 枚举列表 = UInt16 列表 + toCode 映射（reader 侧 fromCode 已有对应分支）
@@ -456,11 +521,12 @@ impl ElmType {
                 ElmType::Primitive(ElmPrimitiveType::String) => {
                     "\\r -> Capnproto.readText r 0".to_string()
                 }
-                ElmType::StructRef(module_name, _, _) => {
-                    if module_name.is_empty() {
-                        "\\r -> decode r |> Result.toMaybe".to_string()
+                ElmType::StructRef(_, _, _) => {
+                    let dec = inner.qualified_decode_fn();
+                    if dec.contains('.') {
+                        format!("\\r -> {dec} r |> Result.toMaybe")
                     } else {
-                        format!("\\r -> {}.decode r |> Result.toMaybe", module_name)
+                        "\\r -> decode r |> Result.toMaybe".to_string()
                     }
                 }
                 ElmType::EnumRef(module_name, _, _, _) => {
@@ -496,6 +562,9 @@ pub struct ElmModule {
     /// decode 是否需要 capTable（传递闭包：直接含 interface 字段，或引用了
     /// 需要 capTable 的 struct 模块）。由 binding::propagate_needs_cap_table 计算。
     pub needs_cap_table: bool,
+    /// SCC 合并的次成员模块（含互递归 struct）。canonical（本模块）保留原名；
+    /// 次成员的全部导出符号渲染时加自身类型名前缀（如 PropEntity / propDecode）。
+    pub merged_members: Vec<ElmModule>,
 }
 
 #[derive(Debug, Clone)]
@@ -582,6 +651,22 @@ impl ElmContext {
             .iter()
             .any(|m| matches!(m.type_def, ElmTypeDef::Interface))
     }
+}
+
+/// 拆前缀实体名："PropEntity" → ("prop", "Entity")；"Entity" → ("", "Entity")。
+/// 合并次成员的所有符号都用该前缀（Prop → propEncode / PropUnion / propDataWords）。
+pub fn split_prefixed_entity(entity: &str) -> (String, String) {
+    if let Some(base) = entity.strip_suffix("Entity") {
+        if !base.is_empty() {
+            let mut c = base.chars();
+            let prefix = match c.next() {
+                Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            };
+            return (prefix, "Entity".to_owned());
+        }
+    }
+    (String::new(), entity.to_owned())
 }
 
 /// 模块的 Elm 引用全名（`path.name`；path 为空时即 `name`）。

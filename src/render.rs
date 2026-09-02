@@ -5,6 +5,7 @@ use crate::elm::{
 use crate::output::{FileWriter, OutputWriter};
 use askama::Template;
 use heck::ToUpperCamelCase;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Template)]
@@ -197,8 +198,190 @@ fn render_server_module(module: &ElmModule) -> anyhow::Result<(PathBuf, String)>
     Ok((PathBuf::from(&file_name), content))
 }
 
+/// 合并成员的符号前缀表：全部导出符号 + 模块级内部符号（Union/dataWords/…）
+fn member_symbol_prefix(member_name: &str, symbols: &[String]) -> HashMap<String, String> {
+    let lower: String = {
+        let mut c = member_name.chars();
+        match c.next() {
+            Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
+            None => String::new(),
+        }
+    };
+    let cap = |s: &str| -> String {
+        let mut c = s.chars();
+        match c.next() {
+            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            None => String::new(),
+        }
+    };
+    let mut map = HashMap::new();
+    let mut push = |sym: &str| {
+        let target = if sym.starts_with(|c: char| c.is_ascii_uppercase()) {
+            format!("{member_name}{sym}")
+        } else {
+            format!("{lower}{}", cap(sym))
+        };
+        map.entry(sym.to_owned()).or_insert(target);
+    };
+    for s in symbols {
+        let s = s.split('(').next().unwrap_or(s); // "Union(..)" → "Union"
+        push(s);
+    }
+    for s in ["Union", "dataWords", "pointerWords", "getWhich", "layout"] {
+        push(s);
+    }
+    map
+}
+
+/// 标识符级整词替换（逐字符扫描）。
+/// 前面紧跟 `.` 的标识符是模块限定引用（如 Semantica.JsonValue.Entity），
+/// 必须保持原名 —— 只有裸标识符（本成员的顶层符号）才加前缀。
+fn rename_identifiers(text: &str, map: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut word = String::new();
+    let mut last_significant: Option<char> = None;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            word.push(ch);
+        } else {
+            if !word.is_empty() {
+                let qualified = last_significant == Some('.');
+                if qualified {
+                    out.push_str(&word);
+                } else if let Some(rep) = map.get(word.as_str()) {
+                    out.push_str(rep);
+                } else {
+                    out.push_str(&word);
+                }
+                word.clear();
+            }
+            // 空白打断限定引用（Elm 的 `Mod.ident` 中点与标识符之间无空白）
+            last_significant = if ch.is_whitespace() { None } else { Some(ch) };
+            out.push(ch);
+        }
+    }
+    if !word.is_empty() {
+        let qualified = last_significant == Some('.');
+        if qualified {
+            out.push_str(&word);
+        } else if let Some(rep) = map.get(word.as_str()) {
+            out.push_str(rep);
+        } else {
+            out.push_str(&word);
+        }
+    }
+    out
+}
+
+/// 剥离 `canon_prefix + 顶层符号` 的自限定引用（Semantica.JsonValue.Entity → Entity）。
+/// 子模块引用（Semantica.JsonValue.Null.Entity）不是顶层符号，保留完整路径——
+/// Elm 的限定名是完整导入路径，不能只写最后一段。
+fn strip_canon_prefix(body: &str, canon_prefix: &str, symbols: &[String]) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(pos) = rest.find(canon_prefix) {
+        let after = &rest[pos + canon_prefix.len()..];
+        let ident_end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        let ident = &after[..ident_end];
+        out.push_str(&rest[..pos]);
+        if symbols.iter().any(|s| s == ident) {
+            out.push_str(ident);
+        } else {
+            out.push_str(&rest[pos..pos + canon_prefix.len() + ident_end]);
+        }
+        rest = &rest[pos + canon_prefix.len() + ident_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 渲染 SCC 合并模块：canonical 分片 + 次成员分片（符号加前缀）拼接。
+fn render_merged_module(canonical: &ElmModule) -> anyhow::Result<(PathBuf, String)> {
+    let full_module_name = format!("{}.{}", canonical.path, canonical.name);
+
+    let mut bodies: Vec<String> = vec![];
+    let mut exports: Vec<String> = vec![];
+
+    // canonical 分片：原名原符号（对自身模块前缀同样剥离——模块内不能自限定）
+    let hf_canon = canonical
+        .fields
+        .iter()
+        .any(|f| f.elm_type.contains_interface_ref());
+    exports.extend(generate_exports(canonical, hf_canon));
+    let canon_prefix = format!("{}.", full_module_name);
+    let mut canon_symbols: Vec<String> = exports.clone();
+    for extra in ["Union", "dataWords", "pointerWords", "getWhich", "layout"] {
+        canon_symbols.push(extra.to_owned());
+    }
+    let canon_body = render_struct(canonical, hf_canon)?;
+
+    // 次成员分片：全部导出符号加成员类型名前缀
+    for member in &canonical.merged_members {
+        let hf = member
+            .fields
+            .iter()
+            .any(|f| f.elm_type.contains_interface_ref());
+        let symbols = generate_exports(member, hf);
+        let body = render_struct(member, hf)?;
+        let map = member_symbol_prefix(&member.name, &symbols);
+        let mut body = rename_identifiers(&body, &map);
+        // layout 记录的字段名是 Capnproto.StructLayout 的固定接口，不随符号前缀改：
+        // `propDataWords = propDataWords` → `dataWords = propDataWords`
+        body = body
+            .replace("propDataWords = propDataWords", "dataWords = propDataWords")
+            .replace(
+                "propPointerWords = propPointerWords",
+                "pointerWords = propPointerWords",
+            );
+        let body = strip_canon_prefix(&body, &canon_prefix, &canon_symbols);
+        bodies.push(body);
+        for sym in symbols {
+            let sym_head = sym.split('(').next().unwrap_or(&sym).to_string();
+            if let Some(renamed) = map.get(&sym_head) {
+                let renamed = renamed.clone();
+                canon_symbols.push(renamed.clone());
+                if sym.contains('(') {
+                    exports.push(format!("{renamed}(..)"));
+                } else {
+                    exports.push(renamed);
+                }
+            }
+        }
+    }
+
+    // canonical 剥离放到成员符号入白名单之后（其分片会引用 PropEntity 等）
+    bodies.insert(
+        0,
+        strip_canon_prefix(&canon_body, &canon_prefix, &canon_symbols),
+    );
+
+    let template = ModuleTemplate {
+        module: canonical,
+        full_module_name: if canonical.path.is_empty() {
+            &canonical.name
+        } else {
+            &full_module_name
+        },
+        exports,
+        body: bodies.join("\n"),
+    };
+    let content = template.render().expect("Failed to render module");
+
+    let file_path = full_module_name
+        .split('.')
+        .map(|seg| seg.to_upper_camel_case())
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok((PathBuf::from(format!("{file_path}.elm")), content))
+}
+
 // 渲染单个模块
 fn render_module(module: &ElmModule) -> anyhow::Result<(PathBuf, String)> {
+    if !module.merged_members.is_empty() {
+        return render_merged_module(module);
+    }
     // 准备模块数据
     let full_module_name = format!("{}.{}", module.path, module.name);
     let has_interface_fields = module
@@ -661,6 +844,26 @@ mod filters {
 
     pub fn type_to_decoder(elm_type: &ElmType) -> askama::Result<String> {
         Ok(elm_type.decoder_expr())
+    }
+
+    /// 跨模块 decode 函数名（合并次成员 → propDecode）
+    pub fn qualified_decode(elm_type: &ElmType) -> askama::Result<String> {
+        Ok(elm_type.qualified_decode_fn())
+    }
+
+    /// 跨模块 encode 函数名（合并次成员 → propEncode）
+    pub fn qualified_encode(elm_type: &ElmType) -> askama::Result<String> {
+        Ok(elm_type.qualified_encode_fn())
+    }
+
+    /// 跨模块 dataWords 常量名（合并次成员 → propDataWords）
+    pub fn qualified_data_words(elm_type: &ElmType) -> askama::Result<String> {
+        Ok(elm_type.qualified_data_words())
+    }
+
+    /// 跨模块 pointerWords 常量名（合并次成员 → propPointerWords）
+    pub fn qualified_pointer_words(elm_type: &ElmType) -> askama::Result<String> {
+        Ok(elm_type.qualified_pointer_words())
     }
 
     // ── 联合分支计数过滤器 ──────────────────────────────

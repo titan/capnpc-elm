@@ -141,12 +141,12 @@ encode {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ pa
                     pointerWords
                         {% else %}
                             {% if (field.elm_type|strip_type_args).is_empty() %} {# 无泛型 Brand #}
-                    {{ field.elm_type|elm_type_module_str }}.encode
+                    {{ field.elm_type|qualified_encode }}
                             {% else %}
-                    ({{ field.elm_type|elm_type_module_str }}.encode {% for arg in field.elm_type|strip_type_args %}{{ arg|type_to_encoder}} {% endfor %})
+                    ({{ field.elm_type|qualified_encode }} {% for arg in field.elm_type|strip_type_args %}{{ arg|type_to_encoder}} {% endfor %})
                             {% endif %}
-                    {{ field.elm_type|elm_type_module_str }}.dataWords
-                    {{ field.elm_type|elm_type_module_str }}.pointerWords
+                    {{ field.elm_type|qualified_data_words }}
+                    {{ field.elm_type|qualified_pointer_words }}
                         {% endif %}
                     soffset
                     ptrOffset
@@ -196,9 +196,9 @@ encode {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ pa
                             dataWords
                             pointerWords
                             {% else %}
-                            {{ branch.elm_type|elm_type_module_str }}.encode
-                            {{ branch.elm_type|elm_type_module_str }}.dataWords
-                            {{ branch.elm_type|elm_type_module_str }}.pointerWords
+                            {{ branch.elm_type|qualified_encode }}
+                            {{ branch.elm_type|qualified_data_words }}
+                            {{ branch.elm_type|qualified_pointer_words }}
                             {% endif %}
                             soffset
                             ptrOffset
@@ -370,7 +370,7 @@ get{{ branch.name|to_upper_camel_case }} reader =
                     {% if branch.elm_type|elm_type_module_str == "" %}{# 当前模块 #}
             |> Maybe.andThen (decode{% if branch.needs_cap_table %} capTable{% endif %} {% for arg in branch.elm_type|strip_type_args %}{{ arg|type_to_decoder }} {% endfor %}>> Result.toMaybe)
                     {% else %}{# 非当前模块 #}
-            |> Maybe.andThen ({{ branch.elm_type|elm_type_module_str }}.decode{% if branch.needs_cap_table %} capTable{% endif %} {% for arg in branch.elm_type|strip_type_args %}{{ arg|type_to_decoder }} {% endfor %}>> Result.toMaybe)
+            |> Maybe.andThen ({{ branch.elm_type|qualified_decode }}{% if branch.needs_cap_table %} capTable{% endif %} {% for arg in branch.elm_type|strip_type_args %}{{ arg|type_to_decoder }} {% endfor %}>> Result.toMaybe)
                     {% endif %}
                 {% else if branch.elm_type|is_enum_ref %}
                     {% if branch|branch_has_nonzero_default %}
@@ -462,7 +462,7 @@ get{{ field.name|to_upper_camel_case }} reader =
         {% else if field.elm_type|is_struct_ref -%}
     Capnproto.getStructPointer reader {{ (module.data_words + field.offset) * 8 }}
         |> Maybe.map (\( r, _, _ ) -> r)
-        |> Maybe.andThen ({{ field.elm_type|elm_type_module_str }}.decode{% if field.needs_cap_table %} capTable{% endif %} {% for arg in field.elm_type|strip_type_args %}{{ arg|type_to_decoder }} {% endfor %}>> Result.toMaybe)
+        |> Maybe.andThen ({{ field.elm_type|qualified_decode }}{% if field.needs_cap_table %} capTable{% endif %} {% for arg in field.elm_type|strip_type_args %}{{ arg|type_to_decoder }} {% endfor %}>> Result.toMaybe)
         {% else if field.elm_type|is_list_type -%}
     get{{ field.name|to_upper_camel_case}}Count reader
         |> Maybe.andThen

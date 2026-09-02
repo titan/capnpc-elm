@@ -411,6 +411,17 @@ impl ElmType {
                         )
                     }
                 }
+                // 枚举列表 = UInt16 列表 + toCode 映射（reader 侧 fromCode 已有对应分支）
+                ElmType::EnumRef(module_name, _, _, _) => {
+                    if module_name.is_empty() {
+                        "(Capnproto.encodePrimitiveIntList 3 2 << List.map toCode)".to_string()
+                    } else {
+                        format!(
+                            "(Capnproto.encodePrimitiveIntList 3 2 << List.map {}.toCode)",
+                            module_name
+                        )
+                    }
+                }
                 _ => "Capnproto.encodeStructList encode dataWords pointerWords".to_string(),
             },
             _ => "Capnproto.encodeStructList encode dataWords pointerWords".to_string(),
@@ -482,6 +493,9 @@ pub struct ElmModule {
     pub discriminant_offset: u32, // Union discriminant offset in bytes
     pub methods: Vec<ElmMethod>,
     pub generic_params: Vec<String>,
+    /// decode 是否需要 capTable（传递闭包：直接含 interface 字段，或引用了
+    /// 需要 capTable 的 struct 模块）。由 binding::propagate_needs_cap_table 计算。
+    pub needs_cap_table: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -503,6 +517,8 @@ pub struct ElmField {
     /// capability in the list returned by `encodeWithCaps`. `None` for
     /// non-capability fields.
     pub cap_slot: Option<usize>,
+    /// 非 union 字段的 getter/decode 是否需要 capTable（struct 引用传递闭包）。
+    pub needs_cap_table: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -513,6 +529,9 @@ pub struct ElmUnionBranch {
     pub offset: u32,      // Field offset within the struct
     pub is_pointer: bool, // Whether this field is a pointer
     pub default_value: Option<ElmDefaultValue>,
+    /// 分支 getter 是否需要 capTable（interface 分支，或指向需要 capTable
+    /// 的 struct 模块的分支）。
+    pub needs_cap_table: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -562,5 +581,14 @@ impl ElmContext {
         self.modules
             .iter()
             .any(|m| matches!(m.type_def, ElmTypeDef::Interface))
+    }
+}
+
+/// 模块的 Elm 引用全名（`path.name`；path 为空时即 `name`）。
+pub fn module_full_name(module: &ElmModule) -> String {
+    if module.path.is_empty() {
+        module.name.clone()
+    } else {
+        format!("{}.{}", module.path, module.name)
     }
 }

@@ -697,6 +697,16 @@ mod filters {
         Ok(s.to_upper_camel_case())
     }
 
+    /// Union 分支名 → Elm 构造器名，避开 Prelude 构造器（`ok` → `Ok` 会遮蔽
+    /// `Result.Ok`，令模板里 decode 的 `Ok Entity` 包装解析错误）。
+    pub fn to_union_ctor(s: &str) -> askama::Result<String> {
+        let ctor = s.to_upper_camel_case();
+        Ok(match ctor.as_str() {
+            "Ok" | "Err" | "Just" | "Nothing" | "LT" | "EQ" | "GT" => format!("{ctor}Value"),
+            _ => ctor,
+        })
+    }
+
     pub fn escape_elm_keyword(s: &str) -> askama::Result<String> {
         // 检查字符串是否是 Elm 关键字
         if ELM_KEYWORDS.contains(s) {

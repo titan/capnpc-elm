@@ -1,13 +1,31 @@
 use crate::capnproto::{Binding, BrandScope, DefaultValue, Node, NodeKind, RequestedFile, Type};
 use crate::elm::{ElmDefaultValue, ElmEnumVariant, ElmField, ElmPrimitiveType, ElmType};
 use heck::ToUpperCamelCase;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// 泛型实例化的单态化任务：持有泛型 struct 节点克隆 + 已映射的类型实参。
+/// Elm 的参数化 type alias 在自引用/复合实参下会无限展开，
+/// 因此每个 `Result(T)` / `Lookup(T)` 实例化都物化为独立的具体模块。
+pub struct SynthJob {
+    pub node: Node,
+    pub env: Vec<ElmType>,
+    pub parent_path: String,
+    pub generic_last: String,
+    pub mangled: String,
+    /// 防碰撞去重键（含实参��名）
+    pub dedup_key: String,
+}
 
 /// 类型映射上下文：封装 node_map / file_id_to_file / 缓存
 pub struct TypeMappingContext<'a> {
     node_map: HashMap<u64, &'a Node>,
     file_id_to_file: HashMap<u64, &'a RequestedFile>,
     cache: HashMap<String, ElmType>,
+    /// 泛型参数替换环境（单态化合成期间生效；binding 层设置/清除）
+    pub(crate) type_param_env: Option<Vec<ElmType>>,
+    /// 待合成的实例化模块
+    pending_synths: Vec<SynthJob>,
+    synth_seen: HashSet<String>,
 }
 
 impl<'a> TypeMappingContext<'a> {
@@ -19,6 +37,9 @@ impl<'a> TypeMappingContext<'a> {
             node_map,
             file_id_to_file,
             cache: HashMap::new(),
+            type_param_env: None,
+            pending_synths: Vec::new(),
+            synth_seen: HashSet::new(),
         }
     }
 
@@ -37,8 +58,12 @@ impl<'a> TypeMappingContext<'a> {
             .is_some_and(|node| matches!(node.kind, NodeKind::Struct { is_group: true, .. }))
     }
 
-    /// 将 Cap'n Proto 类型映射到 Elm 类型（含缓存）
+    /// 将 Cap'n Proto 类型映射到 Elm 类型（含缓存；替换环境下旁路缓存）
     pub fn map_type(&mut self, capnp_type: &Type, current_node_id: u64) -> ElmType {
+        if self.type_param_env.is_some() {
+            return self.map_type_inner(capnp_type, current_node_id);
+        }
+
         let cache_key = self.type_to_cache_key(capnp_type, current_node_id);
 
         if let Some(cached) = self.cache.get(&cache_key) {
@@ -87,6 +112,15 @@ impl<'a> TypeMappingContext<'a> {
                             }
                         }
                     }
+                }
+
+                // 泛型 struct 的已绑定实例化 → 单态化为具体模块
+                let is_generic_def = self
+                    .node_map
+                    .get(id)
+                    .is_some_and(|n| !n.generic_params.is_empty());
+                if is_generic_def && !type_args.is_empty() {
+                    return self.enqueue_generic_instantiation(*id, type_args);
                 }
 
                 ElmType::StructRef(module_name, "Entity", type_args)
@@ -144,6 +178,12 @@ impl<'a> TypeMappingContext<'a> {
             Type::AnyPointer => ElmType::AnyPointer,
             Type::Void => ElmType::Primitive(ElmPrimitiveType::Unit),
             Type::GenericParam(index) => {
+                // 单态化环境下直接替换为具体实参
+                if let Some(env) = &self.type_param_env {
+                    if let Some(t) = env.get(*index as usize) {
+                        return t.clone();
+                    }
+                }
                 if let Some(node) = self.node_map.get(&current_node_id) {
                     if (*index as usize) < node.generic_params.len() {
                         ElmType::GenericParam(node.generic_params[*index as usize].to_lowercase())
@@ -155,6 +195,90 @@ impl<'a> TypeMappingContext<'a> {
                 }
             }
         }
+    }
+
+    /// 登记一个泛型实例化的单态化任务，返回指向合成模块的 Elm 引用。
+    fn enqueue_generic_instantiation(&mut self, id: u64, type_args: Vec<ElmType>) -> ElmType {
+        let mangled = format!(
+            "Of{}",
+            type_args.iter().map(Self::mangle_arg).collect::<Vec<_>>().join("And")
+        );
+        let parent_full = self.get_full_type_name(id);
+        let generic_last = parent_full
+            .rsplit('.')
+            .next()
+            .unwrap_or(&parent_full)
+            .to_string();
+        let parent_path = parent_full
+            .strip_suffix(&format!(".{generic_last}"))
+            .unwrap_or("")
+            .to_string();
+        let synth_full = if parent_path.is_empty() {
+            format!("{generic_last}.{mangled}")
+        } else {
+            format!("{parent_path}.{generic_last}.{mangled}")
+        };
+        // 去重键包含实参全名，避免不同实参意外并成同一模块
+        let dedup_key = format!(
+            "{}|{}",
+            synth_full,
+            type_args
+                .iter()
+                .map(|a| a.to_elm_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        if self.synth_seen.insert(dedup_key.clone()) {
+            if let Some(node) = self.node_map.get(&id) {
+                let mut node = (*node).clone();
+                // 克隆节点不再是泛型定义：模板按具体模块渲染
+                node.generic_params = Vec::new();
+                self.pending_synths.push(SynthJob {
+                    node,
+                    env: type_args,
+                    parent_path,
+                    generic_last,
+                    mangled,
+                    dedup_key,
+                });
+            }
+        }
+        ElmType::StructRef(synth_full, "Entity", vec![])
+    }
+
+    /// ElmType → 模块名段（单态化命名用）
+    fn mangle_arg(t: &ElmType) -> String {
+        match t {
+            ElmType::Primitive(p) => match p {
+                ElmPrimitiveType::Bool => "Bool".to_string(),
+                ElmPrimitiveType::Int(64) => "Word64".to_string(),
+                ElmPrimitiveType::Int(_) => "Int".to_string(),
+                ElmPrimitiveType::Float(_) => "Float".to_string(),
+                ElmPrimitiveType::String => "String".to_string(),
+                ElmPrimitiveType::Bytes => "Bytes".to_string(),
+                ElmPrimitiveType::Unit => "Void".to_string(),
+            },
+            ElmType::AnyPointer => "AnyPointer".to_string(),
+            ElmType::InterfaceRef(m, _, _) => m
+                .rsplit('.')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Cap")
+                .to_string(),
+            ElmType::List(inner) => format!("ListOf{}", Self::mangle_arg(inner)),
+            ElmType::StructRef(m, _, _) | ElmType::EnumRef(m, _, _, _) => m
+                .rsplit('.')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Anon")
+                .to_string(),
+            ElmType::UnionInline(_, _) => "Union".to_string(),
+            ElmType::GenericParam(n) => n.to_upper_camel_case(),
+        }
+    }
+
+    pub fn pop_pending_synth(&mut self) -> Option<SynthJob> {
+        self.pending_synths.pop()
     }
 
     /// 获取节点的完整类型名称
@@ -347,7 +471,7 @@ impl<'a> TypeMappingContext<'a> {
     fn type_to_cache_key(&self, capnp_type: &Type, current_node_id: u64) -> String {
         match capnp_type {
             Type::StructRef(id, brand) => {
-                let mut key = format!("StructRef:{}", id);
+                let mut key = format!("StructRef:{}@{}", id, current_node_id);
                 for scope in &brand.scopes {
                     if let BrandScope::Bind(bindings) = scope {
                         for binding in bindings {
@@ -366,7 +490,7 @@ impl<'a> TypeMappingContext<'a> {
                 key
             }
             Type::EnumRef(id, brand) => {
-                let mut key = format!("EnumRef:{}", id);
+                let mut key = format!("EnumRef:{}@{}", id, current_node_id);
                 for scope in &brand.scopes {
                     if let BrandScope::Bind(bindings) = scope {
                         for binding in bindings {

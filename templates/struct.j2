@@ -2,7 +2,7 @@
     {% if field.elm_type|is_union_type %}
 type Union {% for param in generic_params %}{{param}} {% endfor %}
     {% for branch in field.elm_type|strip_union_branches %}
-    {% if loop.first %}={% else %}|{% endif %} {{ branch.name|to_upper_camel_case }} {{ branch.elm_type|parenthesize_if_needed }}
+    {% if loop.first %}={% else %}|{% endif %} {{ branch.name|to_union_ctor }} {{ branch.elm_type|parenthesize_if_needed }}
     {% endfor %}
     {% endif %}
 {% endfor %}
@@ -42,9 +42,9 @@ encode {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ pa
             case entity.{{ union_field.unwrap().name|escape_elm_keyword }} of
                 {% for branch in union_field.unwrap().elm_type|strip_union_branches %}
                     {% if union_field.unwrap().elm_type|is_union_type %}
-                {{ branch.name|to_upper_camel_case }} {% if !(branch.elm_type|is_void_type) %}_{% endif %} ->
+                {{ branch.name|to_union_ctor }} {% if !(branch.elm_type|is_void_type) %}_{% endif %} ->
                     {% else %}
-                {{ union_field.unwrap().elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} {% if !(branch.elm_type|is_void_type) %}_{% endif %} ->
+                {{ union_field.unwrap().elm_type|elm_type_module_str }}.{{ branch.name|to_union_ctor }} {% if !(branch.elm_type|is_void_type) %}_{% endif %} ->
                     {% endif %}
                     \soffset builder ->
                         Capnproto.writeUInt16 soffset {{ module.discriminant_offset * 2 }} {{ branch.discriminant }} builder
@@ -74,17 +74,17 @@ encode {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ pa
                         {% if !(branch.elm_type|is_void_type) %}
                             {% if branch.elm_type|is_boolean_type %}
                                  {% if field.elm_type|is_union_type %}
-                {{ branch.name|to_upper_camel_case }} value ->
+                {{ branch.name|to_union_ctor }} value ->
                                  {% else %}
-                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_union_ctor }} value ->
                                  {% endif %}
                     \soffset builder ->
                         Capnproto.writeBool soffset {{ branch.offset / 8 }} {{ branch.offset % 8 }} ({% if branch|branch_has_bool_default_true %}Basics.not {% endif %}value) builder
                             {% else if branch.elm_type|is_integer_type || branch.elm_type|is_float_type %}
                                  {% if field.elm_type|is_union_type %}
-                {{ branch.name|to_upper_camel_case }} value ->
+                {{ branch.name|to_union_ctor }} value ->
                                  {% else %}
-                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_union_ctor }} value ->
                                  {% endif %}
                                     {% if branch|branch_has_float_default %}
                     \soffset builder ->
@@ -98,9 +98,9 @@ encode {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ pa
                                     {% endif %}
                             {% else if branch.elm_type|is_enum_ref %}
                                  {% if field.elm_type|is_union_type %}
-                {{ branch.name|to_upper_camel_case }} value ->
+                {{ branch.name|to_union_ctor }} value ->
                                  {% else %}
-                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_union_ctor }} value ->
                                  {% endif %}
                                     {% if branch|branch_has_nonzero_default %}
                     \soffset builder ->
@@ -170,23 +170,23 @@ encode {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ pa
                     {% for branch in field.elm_type|strip_union_branches %}
                         {% if branch.elm_type|is_text_type %}
                             {% if field.elm_type|is_union_type %}
-                {{ branch.name|to_upper_camel_case }} value ->
+                {{ branch.name|to_union_ctor }} value ->
                             {% else %}
-                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_union_ctor }} value ->
                             {% endif %}
                     Capnproto.encodeTextPointer value
                         {% else if branch.elm_type|is_data_type %}
                             {% if field.elm_type|is_union_type %}
-                {{ branch.name|to_upper_camel_case }} value ->
+                {{ branch.name|to_union_ctor }} value ->
                             {% else %}
-                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_union_ctor }} value ->
                             {% endif %}
                     Capnproto.encodeDataPointer value
                         {% else if branch.elm_type|is_struct_ref %}
                             {% if field.elm_type|is_union_type %}
-                {{ branch.name|to_upper_camel_case }} value ->
+                {{ branch.name|to_union_ctor }} value ->
                             {% else %}
-                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_union_ctor }} value ->
                             {% endif %}
                     \soffset ptrOffset builder ->
                         Capnproto.encodeStructPointer
@@ -205,9 +205,9 @@ encode {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ pa
                             builder
                         {% else if branch.elm_type|is_list_type %}
                             {% if field.elm_type|is_union_type %}
-                {{ branch.name|to_upper_camel_case }} value ->
+                {{ branch.name|to_union_ctor }} value ->
                             {% else %}
-                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_union_ctor }} value ->
                             {% endif %}
                     \soffset ptrOffset builder ->
                         Capnproto.encodeListPointer
@@ -218,17 +218,25 @@ encode {% if !generic_params.is_empty() %}{% for param in generic_params %}{{ pa
                             builder
                         {% else if branch.elm_type|is_anypointer_type %}
                             {% if field.elm_type|is_union_type %}
-                {{ branch.name|to_upper_camel_case }} value ->
+                {{ branch.name|to_union_ctor }} value ->
                             {% else %}
-                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_union_ctor }} value ->
                             {% endif %}
                     \soffset ptrOffset builder ->
                         Capnproto.encodeAnyPointer value soffset ptrOffset builder
+                        {% else if branch.elm_type|is_interface_ref %}{# 能力分支：本阶段写 null 指针 #}
+                            {% if field.elm_type|is_union_type %}
+                {{ branch.name|to_union_ctor }} _ ->
+                            {% else %}
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_union_ctor }} _ ->
+                            {% endif %}
+                    \soffset ptrOffset builder ->
+                        Capnproto.encodeNullPointer soffset ptrOffset builder
                         {% else if branch.elm_type|is_generic_param_type %}
                             {% if field.elm_type|is_union_type %}
-                {{ branch.name|to_upper_camel_case }} value ->
+                {{ branch.name|to_union_ctor }} value ->
                             {% else %}
-                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }} value ->
+                {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_union_ctor }} value ->
                             {% endif %}
                     \soffset ptrOffset builder ->
                         Capnproto.encodeAnyPointer ({{ branch.elm_type|elm_type_str }}Encoder value) soffset ptrOffset builder
@@ -334,6 +342,9 @@ get{{ branch.name|to_upper_camel_case }}Reader reader =
                 {% if branch.elm_type|is_generic_param_type %}{# 泛型类型分支 #}
 get{{ branch.name|to_upper_camel_case }} : (Capnproto.AnyPointer -> Maybe {{ branch.elm_type|parenthesize_if_needed }}) -> Capnproto.Reader -> Maybe {{ branch.elm_type|parenthesize_if_needed }}
 get{{ branch.name|to_upper_camel_case }} decoder reader =
+                {% else if branch.elm_type|is_interface_ref || branch.needs_cap_table %}{# 能力分支 / 需向下传 capTable 的分支 #}
+get{{ branch.name|to_upper_camel_case }} : Capnproto.Reader -> List Rpc.Capability -> Maybe {{ branch.elm_type|parenthesize_if_needed }}
+get{{ branch.name|to_upper_camel_case }} reader capTable =
                 {% else %}{# 其它类型分支 #}
 get{{ branch.name|to_upper_camel_case }} : Capnproto.Reader -> Maybe {{ branch.elm_type|parenthesize_if_needed }}
 get{{ branch.name|to_upper_camel_case }} reader =
@@ -357,9 +368,9 @@ get{{ branch.name|to_upper_camel_case }} reader =
         Capnproto.getStructPointer reader {{ (module.data_words + branch.offset) * 8 }}
             |> Maybe.map (\( r, _, _ ) -> r)
                     {% if branch.elm_type|elm_type_module_str == "" %}{# 当前模块 #}
-            |> Maybe.andThen (decode {% for arg in branch.elm_type|strip_type_args %}{{ arg|type_to_decoder }} {% endfor %}>> Result.toMaybe)
+            |> Maybe.andThen (decode{% if branch.needs_cap_table %} capTable{% endif %} {% for arg in branch.elm_type|strip_type_args %}{{ arg|type_to_decoder }} {% endfor %}>> Result.toMaybe)
                     {% else %}{# 非当前模块 #}
-            |> Maybe.andThen ({{ branch.elm_type|elm_type_module_str }}.decode {% for arg in branch.elm_type|strip_type_args %}{{ arg|type_to_decoder }} {% endfor %}>> Result.toMaybe)
+            |> Maybe.andThen ({{ branch.elm_type|elm_type_module_str }}.decode{% if branch.needs_cap_table %} capTable{% endif %} {% for arg in branch.elm_type|strip_type_args %}{{ arg|type_to_decoder }} {% endfor %}>> Result.toMaybe)
                     {% endif %}
                 {% else if branch.elm_type|is_enum_ref %}
                     {% if branch|branch_has_nonzero_default %}
@@ -377,6 +388,9 @@ get{{ branch.name|to_upper_camel_case }} reader =
                 )
                 {% else if branch.elm_type|is_anypointer_type %}
         Capnproto.readAnyPointer reader {{ (module.data_words + branch.offset) * 8 }}
+                {% else if branch.elm_type|is_interface_ref %}{# 能力分支 #}
+        Capnproto.readCapIndex reader {{ (module.data_words + branch.offset) * 8 }}
+            |> Maybe.andThen (\capIndex -> List.drop capIndex capTable |> List.head)
                 {% else if branch.elm_type|is_generic_param_type %}
         Capnproto.readAnyPointer reader {{ (module.data_words + branch.offset) * 8 }}
             |> Maybe.andThen decoder
@@ -424,7 +438,7 @@ get{{ field.name|to_upper_camel_case }}Reader reader =
         {% if field.elm_type|is_generic_param_type %}{# 泛型类型字段 #}
 get{{ field.name|to_upper_camel_case }} : (Capnproto.AnyPointer -> Maybe {{ field.elm_type|parenthesize_if_needed }}) -> Capnproto.Reader -> Maybe {{ field.elm_type|parenthesize_if_needed }}
 get{{ field.name|to_upper_camel_case }} decoder reader =
-        {% else if field.elm_type|is_interface_ref %}{# 能力类型字段 #}
+        {% else if field.elm_type|is_interface_ref || field.needs_cap_table %}{# 能力类型字段 / 需向下传 capTable #}
 get{{ field.name|to_upper_camel_case }} : Capnproto.Reader -> List Rpc.Capability -> Maybe {{ field.elm_type|parenthesize_if_needed }}
 get{{ field.name|to_upper_camel_case }} reader capTable =
         {% else %}{# 其它类型字段 #}
@@ -448,7 +462,7 @@ get{{ field.name|to_upper_camel_case }} reader =
         {% else if field.elm_type|is_struct_ref -%}
     Capnproto.getStructPointer reader {{ (module.data_words + field.offset) * 8 }}
         |> Maybe.map (\( r, _, _ ) -> r)
-        |> Maybe.andThen ({{ field.elm_type|elm_type_module_str }}.decode {% for arg in field.elm_type|strip_type_args %}{{ arg|type_to_decoder }} {% endfor %}>> Result.toMaybe)
+        |> Maybe.andThen ({{ field.elm_type|elm_type_module_str }}.decode{% if field.needs_cap_table %} capTable{% endif %} {% for arg in field.elm_type|strip_type_args %}{{ arg|type_to_decoder }} {% endfor %}>> Result.toMaybe)
         {% else if field.elm_type|is_list_type -%}
     get{{ field.name|to_upper_camel_case}}Count reader
         |> Maybe.andThen
@@ -486,9 +500,9 @@ get{{ field.name|to_upper_camel_case }}At reader index =
 {% endfor %}
 
 
-{% if !generic_params.is_empty() || has_interface_fields %}
-decode : {% for param in generic_params %}(Capnproto.AnyPointer -> Maybe {{ param }}) -> {% endfor %}{% if has_interface_fields %}List Rpc.Capability -> {% endif %}Capnproto.Reader -> Result String (Entity {% for param in generic_params %}{{ param }} {% endfor %})
-decode {% if generic_params.len() > 0 %}{% for param in generic_params %}{{ param }}Decoder {% endfor %}{% endif %}{% if has_interface_fields %}capTable {% endif %}reader =
+{% if !generic_params.is_empty() || module.needs_cap_table %}
+decode : {% for param in generic_params %}(Capnproto.AnyPointer -> Maybe {{ param }}) -> {% endfor %}{% if module.needs_cap_table %}List Rpc.Capability -> {% endif %}Capnproto.Reader -> Result String (Entity {% for param in generic_params %}{{ param }} {% endfor %})
+decode {% if generic_params.len() > 0 %}{% for param in generic_params %}{{ param }}Decoder {% endfor %}{% endif %}{% if module.needs_cap_table %}capTable {% endif %}reader =
 {% else %}
 decode : Capnproto.Reader -> Result String Entity
 decode reader =
@@ -515,16 +529,16 @@ decode reader =
             {% else if branch.elm_type|is_generic_param_type %}
                     get{{ branch.name|to_upper_camel_case }} {{ branch.elm_type|elm_type_str}}Decoder reader
                 {% if field.elm_type|is_union_type %}
-                        |> Maybe.map {{ branch.name|to_upper_camel_case }}
+                        |> Maybe.map {{ branch.name|to_union_ctor }}
                 {% else %}
-                        |> Maybe.map {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }}
+                        |> Maybe.map {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_union_ctor }}
                 {% endif %}
             {% else %}
-                    get{{ branch.name|to_upper_camel_case }} reader
+                    get{{ branch.name|to_upper_camel_case }} reader{% if branch.elm_type|is_interface_ref || branch.needs_cap_table %} capTable{% endif %}
                 {% if field.elm_type|is_union_type %}
-                        |> Maybe.map {{ branch.name|to_upper_camel_case }}
+                        |> Maybe.map {{ branch.name|to_union_ctor }}
                 {% else %}
-                        |> Maybe.map {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_upper_camel_case }}
+                        |> Maybe.map {{ field.elm_type|elm_type_module_str }}.{{ branch.name|to_union_ctor }}
                 {% endif %}
             {% endif %}
         {% endfor %}
@@ -534,7 +548,7 @@ decode reader =
             get{{ field.name|to_upper_camel_case }} reader capTable
     {% else %}
         maybe{{ field.name|to_upper_camel_case }} =
-            get{{ field.name|to_upper_camel_case }} reader
+            get{{ field.name|to_upper_camel_case }} reader{% if field.needs_cap_table %} capTable{% endif %}
     {% endif %}
 {% endfor %}
     in
@@ -561,7 +575,7 @@ fromAnyPointer : {% for param in generic_params %}(Capnproto.AnyPointer -> Maybe
 fromAnyPointer {% for param in generic_params %}{{ param }}Decoder {% endfor %}pointer =
     case pointer of
         Capnproto.AnyPointerDecoded info ->
-            decode {% for param in generic_params %}{{ param }}Decoder {% endfor %}{% if has_interface_fields %}[] {% endif %}info.target
+            decode {% for param in generic_params %}{{ param }}Decoder {% endfor %}{% if module.needs_cap_table %}[] {% endif %}info.target
                 |> Result.toMaybe
 
         _ ->
@@ -583,7 +597,7 @@ fromAnyPointer : Capnproto.AnyPointer -> Maybe Entity
 fromAnyPointer pointer =
     case pointer of
         Capnproto.AnyPointerDecoded info ->
-            decode {% if has_interface_fields %}[] {% endif %}info.target
+            decode {% if module.needs_cap_table %}[] {% endif %}info.target
                 |> Result.toMaybe
 
         _ ->

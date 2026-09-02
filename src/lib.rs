@@ -78,6 +78,7 @@ pub fn bind_to_elm(
         };
         binding::append_rpc_modules(&mut context, &rpc.nodes, &rpc.requested_files);
     }
+    binding::propagate_needs_cap_table(&mut context);
     Ok(context)
 }
 

@@ -199,6 +199,11 @@ fn build_struct_contents(node: &Node, ctx: &mut TypeMappingContext) -> BuiltStru
         unreachable!("build_struct_contents 只接受 struct 节点")
     };
 
+    // 判别式偏移：顶层匿名 union 用外层节点值；仅含命名 union 的 struct
+    // （如 rpc.capnp Call/Disembargo）必须在下方从嵌套 group 节点覆盖，
+    // 否则 getWhich/writeUInt16 的 tag 偏移错成 0，破坏线格式。
+    let mut discriminant_offset = *offset;
+
     convert_fields(capnp_fields, &mut fields, &mut imports, ctx, node.id);
 
     if let Some(union_fields) = union_fields {
@@ -220,7 +225,7 @@ fn build_struct_contents(node: &Node, ctx: &mut TypeMappingContext) -> BuiltStru
             name: "unnamedUnion".to_string(), // 固定字段名
             discriminant: None,
             elm_type: ElmType::UnionInline(branches, generic_params.clone()),
-            offset: *offset,
+            offset: discriminant_offset,
             is_union_container: true,
             default_value: None,
             cap_slot: None,
@@ -254,12 +259,15 @@ fn build_struct_contents(node: &Node, ctx: &mut TypeMappingContext) -> BuiltStru
                     branches.push(branch);
                 }
 
+                // 命名 union 的 tag 偏移属于嵌套节点，覆盖顶层值
+                discriminant_offset = *offset;
+
                 let named_union = ElmField {
                     name: TypeMappingContext::extract_type_name(&nested.display_name)
                         .to_lower_camel_case(),
                     discriminant: None,
                     elm_type: ElmType::UnionInline(branches, generic_params.clone()),
-                    offset: *offset,
+                    offset: discriminant_offset,
                     is_union_container: true,
                     default_value: None,
                     cap_slot: None,
@@ -278,7 +286,7 @@ fn build_struct_contents(node: &Node, ctx: &mut TypeMappingContext) -> BuiltStru
         imports,
         data_words: *data_word_count as u32,
         pointer_words: *pointer_word_count as u32,
-        discriminant_offset: *offset,
+        discriminant_offset,
     }
 }
 

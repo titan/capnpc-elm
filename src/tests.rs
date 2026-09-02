@@ -173,6 +173,62 @@ fn level_request() -> Vec<u8> {
     })
 }
 
+/// struct Machine {
+///   power @0 :UInt64;
+///   mode :union { on @2 :Void; off @3 :Void; }
+/// }
+/// 命名（内嵌）union：判别式偏移挂在嵌套 group 节点上（此处 =3，即字节 6），
+/// 镜像 rpc.capnp Call/Disembargo 的形态。
+fn machine_request() -> Vec<u8> {
+    build_message(|mut req| {
+        {
+            let mut nodes = req.reborrow().init_nodes(3);
+            init_file_node(nodes.reborrow().get(0));
+
+            let mut n = nodes.reborrow().get(1);
+            n.set_id(200);
+            n.set_scope_id(FILE_ID);
+            n.set_display_name("/t.capnp:Machine");
+            let mut s = n.init_struct();
+            s.set_data_word_count(1);
+            s.set_pointer_count(0);
+            s.set_discriminant_offset(0);
+            let mut fields = s.init_fields(2);
+            add_slot(fields.reborrow().get(0), "power", 0, |mut t| {
+                t.set_uint64(());
+            }, None);
+            let mut f = fields.reborrow().get(1);
+            f.set_name("mode");
+            f.set_discriminant_value(0xffff);
+            f.init_group().set_type_id(201);
+
+            let mut n = nodes.reborrow().get(2);
+            n.set_id(201);
+            n.set_scope_id(200);
+            n.set_display_name("/t.capnp:Machine.mode");
+            let mut s = n.init_struct();
+            s.set_is_group(true);
+            s.set_data_word_count(1);
+            s.set_pointer_count(0);
+            s.set_discriminant_offset(3);
+            let mut fields = s.init_fields(2);
+            let mut f = fields.reborrow().get(0);
+            f.set_name("on");
+            f.set_discriminant_value(0);
+            let mut slot = f.init_slot();
+            slot.set_offset(0);
+            slot.reborrow().init_type().set_void(());
+            let mut f = fields.reborrow().get(1);
+            f.set_name("off");
+            f.set_discriminant_value(1);
+            let mut slot = f.init_slot();
+            slot.set_offset(0);
+            slot.reborrow().init_type().set_void(());
+        }
+        set_single_requested_file(req);
+    })
+}
+
 const IFACE_ID: u64 = 5;
 const PARAM_ID: u64 = 10;
 const RESULT_ID: u64 = 11;
@@ -308,6 +364,26 @@ fn nonzero_default_generates_xor_mask() {
     assert!(
         m.contains("Bitwise.xor entity.level 5"),
         "default 5 must XOR-mask on encode:\n{m}"
+    );
+}
+
+/// 命名 union 的判别式偏移必须来自嵌套 group 节点（回归测试：
+/// build_struct_contents 重构曾丢失该传递，tag 错写到字节 0，破坏线格式）
+#[test]
+fn named_union_discriminant_offset_comes_from_nested_node() {
+    let out = render_request(machine_request());
+    let m = find(&out, "Machine.elm");
+    assert!(
+        m.contains("Capnproto.readUInt16 reader 6"),
+        "getWhich must read the tag at discriminant_offset 3 (byte 6):\n{m}"
+    );
+    assert!(
+        m.contains("Capnproto.writeUInt16 soffset 6 0 builder"),
+        "encode must write branch tag 0 at byte 6:\n{m}"
+    );
+    assert!(
+        m.contains("Capnproto.writeUInt16 soffset 6 1 builder"),
+        "encode must write branch tag 1 at byte 6:\n{m}"
     );
 }
 
